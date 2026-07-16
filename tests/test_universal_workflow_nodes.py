@@ -1,0 +1,235 @@
+import importlib.util
+from pathlib import Path
+import unittest
+
+import numpy as np
+import torch
+
+
+MODULE_PATH = Path(__file__).resolve().parents[1] / "nodes.py"
+SPEC = importlib.util.spec_from_file_location("mask_region_tile_universal_nodes", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(MODULE)
+
+
+class UniversalWorkflowNodeTests(unittest.TestCase):
+    def test_sam_locator_boxes_become_native_aligned_context_crops(self):
+        image = torch.zeros((1, 700, 1000, 3), dtype=torch.float32)
+        boxes = [[
+            {"x": 100.3, "y": 200.2, "width": 400.1, "height": 80.6, "score": 0.92},
+            {"x": 103.0, "y": 202.0, "width": 398.0, "height": 79.0, "score": 0.88},
+            {"x": 700.0, "y": 50.0, "width": 100.0, "height": 100.0, "score": 0.2},
+        ]]
+        regions, xs, ys, widths, heights, report = MODULE.BoundingBoxCropBatch().crop(
+            image,
+            boxes,
+            minimum_score=0.5,
+            context_pixels=64,
+            multiple=16,
+            deduplicate_iou=0.85,
+        )
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(widths[0] % 16, 0)
+        self.assertEqual(heights[0] % 16, 0)
+        self.assertLessEqual(xs[0], 100)
+        self.assertLessEqual(ys[0], 200)
+        self.assertGreaterEqual(xs[0] + widths[0], 501)
+        self.assertGreaterEqual(ys[0] + heights[0], 281)
+        self.assertEqual(tuple(regions[0].shape[1:3]), (heights[0], widths[0]))
+        self.assertIn('"crop_count": 1', report)
+
+    def test_native_scan_windows_cover_arbitrary_image_without_resizing(self):
+        image = torch.zeros((1, 100, 250, 3), dtype=torch.float32)
+        windows, xs, ys, widths, heights, _ = MODULE.ImageGridWindows().split(
+            image, window_size=128, overlap=32
+        )
+        coverage = np.zeros((100, 250), dtype=np.uint8)
+        for window, x, y, width, height in zip(windows, xs, ys, widths, heights):
+            self.assertEqual(tuple(window.shape[1:3]), (height, width))
+            coverage[y : y + height, x : x + width] += 1
+        self.assertTrue(np.all(coverage > 0))
+        self.assertGreater(len(windows), 1)
+
+    def test_sam_window_masks_merge_back_to_exact_full_coordinates(self):
+        image = torch.zeros((1, 6, 8, 3), dtype=torch.float32)
+        masks = [
+            torch.ones((1, 4, 5)),
+            torch.full((1, 4, 5), 0.5),
+            torch.full((1, 4, 5), 0.25),
+            torch.full((1, 4, 5), 0.5),
+        ]
+        merged, _ = MODULE.MaskGridMerge().merge(
+            [image],
+            masks,
+            [0, 3, 0, 3],
+            [0, 0, 2, 2],
+            [5, 5, 5, 5],
+            [4, 4, 4, 4],
+            [0.2],
+            [1],
+            [True],
+        )
+        self.assertEqual(tuple(merged.shape), (1, 6, 8))
+        self.assertTrue(torch.all(merged[:, 0:4, 0:5] >= 1.0))
+        self.assertTrue(torch.all(merged[:, 4:6, 3:8] == 0.5))
+
+    def test_automatic_manual_union_and_protection_subtraction(self):
+        image = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        automatic = torch.zeros((1, 8, 8))
+        manual = torch.zeros((1, 8, 8))
+        protection = torch.zeros((1, 8, 8))
+        automatic[:, 2:4, 1:5] = 1.0
+        manual[:, 5:7, 4:7] = 1.0
+        protection[:, 2:3, 2:4] = 1.0
+        target, auto_out, manual_out, protect_out, overlay = MODULE.MaskUnionManualProtect().combine(
+            image,
+            automatic,
+            manual,
+            "automatic_plus_manual",
+            0.001,
+            protection_mask=protection,
+        )
+        self.assertEqual(int(torch.count_nonzero(target).item()), 12)
+        self.assertTrue(torch.all(target[:, 2:3, 2:4] == 0))
+        self.assertTrue(torch.equal(auto_out, automatic))
+        self.assertTrue(torch.equal(manual_out, manual))
+        self.assertTrue(torch.equal(protect_out, protection))
+        self.assertEqual(tuple(overlay.shape), tuple(image.shape))
+
+    def test_sam_consensus_rejects_a_single_window_false_positive(self):
+        image = torch.zeros((1, 4, 6, 3), dtype=torch.float32)
+        left = torch.zeros((1, 4, 4), dtype=torch.float32)
+        right = torch.zeros((1, 4, 4), dtype=torch.float32)
+        left[:, 1:3, 2:4] = 1.0
+        right[:, 1:3, 0:2] = 1.0
+        left[:, 0, 2] = 1.0
+        merged, report = MODULE.MaskGridMerge().merge(
+            [image],
+            [left, right],
+            [0, 2],
+            [0, 0],
+            [4, 4],
+            [4, 4],
+            [0.5],
+            [2],
+            [False],
+        )
+        self.assertTrue(torch.all(merged[:, 1:3, 2:4] == 1.0))
+        self.assertEqual(float(merged[0, 0, 2]), 0.0)
+        self.assertIn('"rejected_detected_pixels": 1', report)
+
+    def test_manual_mask_can_erase_automatic_false_positive(self):
+        image = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
+        automatic = torch.ones((1, 4, 4), dtype=torch.float32)
+        correction = torch.zeros((1, 4, 4), dtype=torch.float32)
+        correction[:, 1:3, 1:3] = 1.0
+        target, *_ = MODULE.MaskUnionManualProtect().combine(
+            image,
+            automatic,
+            correction,
+            "automatic_minus_manual",
+            0.001,
+        )
+        self.assertTrue(torch.all(target[:, 1:3, 1:3] == 0.0))
+        self.assertEqual(int(torch.count_nonzero(target).item()), 12)
+
+    def test_manual_add_and_erase_are_applied_in_one_pass(self):
+        image = torch.zeros((1, 5, 5, 3), dtype=torch.float32)
+        automatic = torch.zeros((1, 5, 5), dtype=torch.float32)
+        addition = torch.zeros((1, 5, 5), dtype=torch.float32)
+        erasure = torch.zeros((1, 5, 5), dtype=torch.float32)
+        automatic[:, 1:3, 1:3] = 1.0
+        addition[:, 3:5, 3:5] = 1.0
+        erasure[:, 1, 1] = 1.0
+        target, *_ = MODULE.MaskUnionManualProtect().combine(
+            image,
+            automatic,
+            addition,
+            "automatic_plus_add_minus_erase",
+            0.001,
+            manual_erase_mask=erasure,
+        )
+        self.assertEqual(float(target[0, 1, 1]), 0.0)
+        self.assertTrue(torch.all(target[:, 3:5, 3:5] == 1.0))
+        self.assertEqual(int(torch.count_nonzero(target).item()), 7)
+
+    def test_tile_expansion_defaults_and_per_tile_overrides(self):
+        self.assertEqual(MODULE._parse_expansion_overrides(4, 128, ""), [128, 128, 128, 128])
+        self.assertEqual(
+            MODULE._parse_expansion_overrides(4, 128, "1=192,3=256"),
+            [128, 192, 128, 256],
+        )
+        self.assertEqual(
+            MODULE._parse_expansion_overrides(4, 128, "128,192,224"),
+            [128, 192, 224, 128],
+        )
+
+    def test_invalid_tile_expansion_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            MODULE._parse_expansion_overrides(3, 128, "1=160")
+
+    def test_dynamic_tile_batch_matches_planner_coordinates(self):
+        mask = np.zeros((512, 1800), dtype=np.float32)
+        mask[220:236, 80:1720] = 1.0
+        plan = MODULE.build_region_tile_plan(
+            mask,
+            max_long_side=768,
+            max_short_side=512,
+            max_pixels=393216,
+            context_pixels=96,
+            min_target_extent=128,
+        )
+        image = torch.rand((1, 512, 1800, 3), dtype=torch.float32)
+        protection = torch.zeros((1, 512, 1800), dtype=torch.float32)
+        result = MODULE.MaskRegionTileBatch().prepare(image, plan, protection, "128", "1=192")
+        tile_images, ownership, _, xs, ys, widths, heights, grows, blurs, indexes, _ = result
+        self.assertEqual(len(tile_images), plan["count"])
+        self.assertEqual(grows[0], 128)
+        self.assertEqual(grows[1], 192)
+        self.assertEqual(blurs[1], 97)
+        for index, tile in enumerate(plan["tiles"]):
+            self.assertEqual((xs[index], ys[index], widths[index], heights[index]), (
+                tile["x"], tile["y"], tile["width"], tile["height"]
+            ))
+            self.assertEqual(tuple(tile_images[index].shape[1:3]), (tile["height"], tile["width"]))
+            self.assertEqual(tuple(ownership[index].shape[1:]), (tile["height"], tile["width"]))
+            self.assertEqual(indexes[index], index)
+
+    def test_weighted_merge_has_strict_outside_and_normalized_overlap(self):
+        destination = torch.full((1, 6, 8, 3), 0.2, dtype=torch.float32)
+        candidate0 = torch.full((1, 2, 4, 3), 0.4, dtype=torch.float32)
+        candidate1 = torch.full((1, 2, 4, 3), 0.8, dtype=torch.float32)
+        masks = [torch.ones((1, 2, 4)), torch.ones((1, 2, 4))]
+        merged, union, _, _, report = MODULE.MaskRegionWeightedMerge().merge(
+            [destination],
+            [candidate0, candidate1],
+            masks,
+            [1, 3],
+            [2, 2],
+            [4, 4],
+            [2, 2],
+            [0.02],
+            [128],
+            [0.05],
+        )
+        self.assertTrue(torch.equal(merged[:, 0:2], destination[:, 0:2]))
+        self.assertTrue(torch.equal(merged[:, 4:6], destination[:, 4:6]))
+        self.assertTrue(torch.all(union[:, 2:4, 1:7] == 1))
+        self.assertTrue(torch.all(union[:, :, 0] == 0))
+        overlap = merged[:, 2:4, 3:5]
+        self.assertTrue(torch.all(overlap > 0.4))
+        self.assertTrue(torch.all(overlap < 0.8))
+        self.assertIn('"normalized_candidate_weight_sum_in_union": 1.0', report)
+
+    def test_prompt_suffix_is_fixed_but_instruction_is_user_editable(self):
+        node = MODULE.AppendPreservationPrompt()
+        prompt = node.build("Replace the selected tattoo with natural skin.")[0]
+        self.assertEqual(
+            prompt,
+            "Replace the selected tattoo with natural skin. Do not change anything else in the image.",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

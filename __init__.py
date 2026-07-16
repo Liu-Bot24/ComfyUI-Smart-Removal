@@ -1,0 +1,38 @@
+from .nodes import (
+    AppendPreservationPrompt,
+    BoundingBoxCropBatch,
+    ImageGridWindows,
+    MaskGridMerge,
+    MaskRegionTileAtIndex,
+    MaskRegionTileBatch,
+    MaskRegionTilePlanner,
+    MaskRegionWeightedMerge,
+    MaskUnionManualProtect,
+)
+
+
+NODE_CLASS_MAPPINGS = {
+    "MaskRegionTilePlannerExact": MaskRegionTilePlanner,
+    "MaskRegionTileAtIndexExact": MaskRegionTileAtIndex,
+    "UniversalImageGridWindowsExact": ImageGridWindows,
+    "UniversalBoundingBoxCropBatchExact": BoundingBoxCropBatch,
+    "UniversalMaskGridMergeExact": MaskGridMerge,
+    "UniversalMaskUnionManualProtectExact": MaskUnionManualProtect,
+    "UniversalRegionTileBatchExact": MaskRegionTileBatch,
+    "UniversalRegionWeightedMergeExact": MaskRegionWeightedMerge,
+    "UniversalAppendPreservationPrompt": AppendPreservationPrompt,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MaskRegionTilePlannerExact": "Mask Region Tile Planner (Exact)",
+    "MaskRegionTileAtIndexExact": "Get Region Tile (Exact)",
+    "UniversalImageGridWindowsExact": "Universal SAM3 Scan Windows (Native)",
+    "UniversalBoundingBoxCropBatchExact": "SAM3 Detections to Native Regions",
+    "UniversalMaskGridMergeExact": "Merge SAM3 Window Masks (Exact)",
+    "UniversalMaskUnionManualProtectExact": "Automatic + Manual Mask (Protected)",
+    "UniversalRegionTileBatchExact": "Prepare Dynamic Region Tiles",
+    "UniversalRegionWeightedMergeExact": "Merge Dynamic Region Tiles (Normalized)",
+    "UniversalAppendPreservationPrompt": "Edit Instruction + Preserve Suffix",
+}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
