@@ -20,7 +20,7 @@ The nodes do not resize the source image. Their hard invariants are:
 
 Connect the dynamic tile outputs directly to a mapped local generation chain. Feed the generated tile list and compositing-mask list to the normalized merge node, then use ComfyUI's core `ImageCompositeMasked` with `resize_source=false` for the final full-resolution composite.
 
-For manual correction, use separate `LoadImage` Mask Editor nodes for additions, erasures, and protected areas. The default mode evaluates `automatic + add - erase - protect` in one pass.
+For manual correction, fan one `LoadImage.IMAGE` output into three core `Painter` nodes for additions, erasures, and protected areas. Feed their independent mask outputs to the combine node. The default mode evaluates `automatic + add - erase - protect` in one pass, while the image itself is uploaded only once.
 
 ## Install
 
