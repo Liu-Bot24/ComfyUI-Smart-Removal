@@ -180,7 +180,7 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertEqual(
             controls.resolve(
                 "移除纹身，保持其他内容不变。",
-                "标准（已验证）",
+                "标准",
                 "标准（32）",
                 "2=64",
                 "标准（8）",
@@ -191,6 +191,10 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertEqual(
             controls.resolve("测试", "保守（小块）", "精细（8）", "", "硬边（0）", ""),
             (1024, 768, 786432, 160, 8, "", 0, "", "测试"),
+        )
+        self.assertEqual(
+            controls.resolve("兼容旧工作流", "标准（已验证）", "标准（32）", "", "标准（8）", ""),
+            (1536, 1024, 1572864, 192, 32, "", 8, "", "兼容旧工作流"),
         )
         self.assertEqual(
             controls.resolve("测试", "大块（高显存）", "大范围（128）", "1=192", "柔和（16）", "1=24"),

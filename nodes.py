@@ -16,8 +16,12 @@ MAX_RESOLUTION = 16384
 
 TILE_CONTROL_PROFILES = {
     "保守（小块）": (1024, 768, 786432, 160),
-    "标准（已验证）": (1536, 1024, 1572864, 192),
+    "标准": (1536, 1024, 1572864, 192),
     "大块（高显存）": (2048, 1280, 2621440, 256),
+}
+
+TILE_CONTROL_PROFILE_ALIASES = {
+    "标准（已验证）": "标准",
 }
 
 GROW_CONTROL_PROFILES = {
@@ -1346,8 +1350,8 @@ class LocalEditTileControls:
                 "tile_profile": (
                     list(TILE_CONTROL_PROFILES),
                     {
-                        "default": "标准（已验证）",
-                        "tooltip": "手动显存档位；不会伪装成自动显存检测。标准档沿用当前已验证参数。",
+                        "default": "标准",
+                        "tooltip": "手动分块档位；显存不足时选小块，显存充足时可选大块。",
                     },
                 ),
                 "default_grow": (
@@ -1402,6 +1406,7 @@ class LocalEditTileControls:
         default_blur,
         tile_blur_overrides,
     ):
+        tile_profile = TILE_CONTROL_PROFILE_ALIASES.get(str(tile_profile), str(tile_profile))
         if tile_profile not in TILE_CONTROL_PROFILES:
             raise ValueError(f"未知分块档位：{tile_profile}")
         if default_grow not in GROW_CONTROL_PROFILES:
