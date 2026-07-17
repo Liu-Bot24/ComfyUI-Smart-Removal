@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -196,6 +197,10 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
             controls.resolve("测试", "大块（高显存）", "大范围（128）", "1=192", "柔和（16）", "1=24"),
             (2048, 1536, 3145728, 256, 128, "1=192", 16, "1=24", "测试"),
         )
+        self.assertEqual(
+            controls.resolve("测试", "标准", "标准（32）", "2=256", "标准（8）", ""),
+            (1536, 1024, 1572864, 288, 32, "2=256", 8, "", "测试"),
+        )
 
     def test_independent_grow_and_blur_overrides(self):
         self.assertEqual(
@@ -252,7 +257,7 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
             max_long_side=512,
             max_short_side=256,
             max_pixels=131072,
-            context_pixels=64,
+            context_pixels=128,
             min_target_extent=128,
         )
         image = torch.full((1, 256, 768, 3), 0.5, dtype=torch.float32)
@@ -263,8 +268,11 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         raw_tiles = result[0]
         grows = result[7]
         blurs = result[8]
-        previews = result[-1]
+        previews = result[11]
+        shared_masks = result[12]
+        global_alpha = result[13]
         self.assertEqual(len(previews), plan["count"])
+        self.assertEqual(len(shared_masks), plan["count"])
         self.assertEqual(grows[0], 32)
         self.assertEqual(blurs[0], 8)
         if plan["count"] > 1:
@@ -273,6 +281,57 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertTrue(torch.all(raw_tiles[0] == 0.5))
         self.assertFalse(torch.equal(previews[0], raw_tiles[0]))
         self.assertEqual(tuple(previews[0].shape), tuple(raw_tiles[0].shape))
+        self.assertEqual(tuple(global_alpha.shape), (1, 256, 768))
+        report = json.loads(result[10])
+        self.assertEqual(report["shared_generation"]["seam_guard_single_coverage_pixels"], 0)
+        self.assertGreater(report["shared_generation"]["overlap_pixels"], 0)
+
+    def test_shared_generation_rejects_insufficient_internal_overlap_before_flux(self):
+        mask = np.zeros((256, 768), dtype=np.float32)
+        mask[120:136, 40:728] = 1.0
+        plan = MODULE.build_region_tile_plan(
+            mask,
+            max_long_side=512,
+            max_short_side=256,
+            max_pixels=131072,
+            context_pixels=64,
+            min_target_extent=128,
+        )
+        image = torch.full((1, 256, 768, 3), 0.5, dtype=torch.float32)
+        protection = torch.zeros((1, 256, 768), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "距离局部块边缘不足"):
+            MODULE.MaskRegionTileBatchControlled().prepare_controlled(
+                image, plan, protection, 64, "", 4, ""
+            )
+
+    def test_shared_generation_keeps_protection_exactly_outside_global_alpha(self):
+        mask = np.zeros((256, 768), dtype=np.float32)
+        mask[96:160, 40:728] = 1.0
+        protection_array = np.zeros_like(mask)
+        protection_array[108:148, 350:418] = 1.0
+        plan = MODULE.build_region_tile_plan(
+            mask,
+            max_long_side=512,
+            max_short_side=256,
+            max_pixels=131072,
+            context_pixels=128,
+            min_target_extent=128,
+        )
+        result = MODULE.MaskRegionTileBatchControlled().prepare_controlled(
+            torch.full((1, 256, 768, 3), 0.5, dtype=torch.float32),
+            plan,
+            torch.from_numpy(protection_array).unsqueeze(0),
+            32,
+            "",
+            8,
+            "",
+        )
+        global_alpha = result[13][0]
+        self.assertTrue(torch.all(global_alpha[108:148, 350:418] == 0))
+        self.assertEqual(
+            json.loads(result[10])["shared_generation"]["seam_guard_single_coverage_pixels"],
+            0,
+        )
 
     def test_weighted_merge_has_strict_outside_and_normalized_overlap(self):
         destination = torch.full((1, 6, 8, 3), 0.2, dtype=torch.float32)
@@ -299,6 +358,28 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertTrue(torch.all(overlap > 0.4))
         self.assertTrue(torch.all(overlap < 0.8))
         self.assertIn('"normalized_candidate_weight_sum_in_union": 1.0', report)
+
+    def test_weighted_merge_crossfades_without_exact_half_plateau(self):
+        destination = torch.zeros((1, 40, 50, 3), dtype=torch.float32)
+        candidate0 = torch.zeros((1, 30, 30, 3), dtype=torch.float32)
+        candidate1 = torch.ones((1, 30, 30, 3), dtype=torch.float32)
+        masks = [torch.ones((1, 30, 30)), torch.ones((1, 30, 30))]
+        merged, _, _, _, report = MODULE.MaskRegionWeightedMerge().merge(
+            [destination],
+            [candidate0, candidate1],
+            masks,
+            [0, 20],
+            [5, 5],
+            [30, 30],
+            [30, 30],
+            [0.02],
+            [128],
+            [0.05],
+        )
+        transition = merged[0, 20, 20:30, 0]
+        self.assertTrue(torch.all(torch.diff(transition) > 0))
+        self.assertFalse(torch.any(transition == 0.5))
+        self.assertIn("normalized_squared_separable_safe_crop_distance", report)
 
     def test_prompt_suffix_is_fixed_but_instruction_is_user_editable(self):
         node = MODULE.AppendPreservationPrompt()
