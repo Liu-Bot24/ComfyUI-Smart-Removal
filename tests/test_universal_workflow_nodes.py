@@ -158,7 +158,7 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertEqual(MODULE._parse_expansion_overrides(4, 128, ""), [128, 128, 128, 128])
         self.assertEqual(
             MODULE._parse_expansion_overrides(4, 128, "1=192,3=256"),
-            [128, 192, 128, 256],
+            [192, 128, 256, 128],
         )
         self.assertEqual(
             MODULE._parse_expansion_overrides(4, 128, "128,192,224"),
@@ -166,8 +166,29 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         )
 
     def test_invalid_tile_expansion_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "must be one of"):
+        with self.assertRaisesRegex(ValueError, "只能使用"):
             MODULE._parse_expansion_overrides(3, 128, "1=160")
+
+    def test_tile_expansion_rejects_out_of_range_human_block_number(self):
+        with self.assertRaisesRegex(ValueError, "块号 0 无效.*1 到 3"):
+            MODULE._parse_expansion_overrides(3, 128, "0=192")
+        with self.assertRaisesRegex(ValueError, "块号 4 无效.*1 到 3"):
+            MODULE._parse_expansion_overrides(3, 128, "4=192")
+
+    def test_local_edit_tile_controls_resolve_manual_profiles(self):
+        controls = MODULE.LocalEditTileControls()
+        self.assertEqual(
+            controls.resolve("标准（已验证）", "128", "2=192"),
+            (1536, 1024, 1572864, 192, 128, "2=192"),
+        )
+        self.assertEqual(
+            controls.resolve("保守（小块）", "256", ""),
+            (1024, 768, 786432, 160, 256, ""),
+        )
+        self.assertEqual(
+            controls.resolve("大块（高显存）", "224", "1=256"),
+            (2048, 1280, 2621440, 256, 224, "1=256"),
+        )
 
     def test_dynamic_tile_batch_matches_planner_coordinates(self):
         mask = np.zeros((512, 1800), dtype=np.float32)
@@ -182,7 +203,7 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         )
         image = torch.rand((1, 512, 1800, 3), dtype=torch.float32)
         protection = torch.zeros((1, 512, 1800), dtype=torch.float32)
-        result = MODULE.MaskRegionTileBatch().prepare(image, plan, protection, "128", "1=192")
+        result = MODULE.MaskRegionTileBatch().prepare(image, plan, protection, "128", "2=192")
         tile_images, ownership, _, xs, ys, widths, heights, grows, blurs, indexes, _ = result
         self.assertEqual(len(tile_images), plan["count"])
         self.assertEqual(grows[0], 128)
@@ -195,6 +216,29 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
             self.assertEqual(tuple(tile_images[index].shape[1:3]), (tile["height"], tile["width"]))
             self.assertEqual(tuple(ownership[index].shape[1:]), (tile["height"], tile["width"]))
             self.assertEqual(indexes[index], index)
+
+    def test_controlled_tile_batch_adds_labeled_preview_without_changing_raw_tiles(self):
+        mask = np.zeros((256, 768), dtype=np.float32)
+        mask[120:136, 40:728] = 1.0
+        plan = MODULE.build_region_tile_plan(
+            mask,
+            max_long_side=512,
+            max_short_side=256,
+            max_pixels=131072,
+            context_pixels=64,
+            min_target_extent=128,
+        )
+        image = torch.full((1, 256, 768, 3), 0.5, dtype=torch.float32)
+        protection = torch.zeros((1, 256, 768), dtype=torch.float32)
+        result = MODULE.MaskRegionTileBatchControlled().prepare_controlled(
+            image, plan, protection, 128, "2=192"
+        )
+        raw_tiles = result[0]
+        previews = result[-1]
+        self.assertEqual(len(previews), plan["count"])
+        self.assertTrue(torch.all(raw_tiles[0] == 0.5))
+        self.assertFalse(torch.equal(previews[0], raw_tiles[0]))
+        self.assertEqual(tuple(previews[0].shape), tuple(raw_tiles[0].shape))
 
     def test_weighted_merge_has_strict_outside_and_normalized_overlap(self):
         destination = torch.full((1, 6, 8, 3), 0.2, dtype=torch.float32)

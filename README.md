@@ -6,6 +6,8 @@ ComfyUI nodes for complete native-resolution local editing workflows:
 - **Get Region Tile (Exact)** returns one tile's coordinates and local ownership mask by index.
 - **SAM3 Detections to Native Regions** converts full-image detections into aligned context crops.
 - **Universal SAM3 Scan Windows (Native)** and **Merge SAM3 Window Masks (Exact)** provide an optional overlap-consensus scan path.
+- **Universal Local Edit Controls** provides one manual tile-size profile, one default expansion, and optional 1-based per-tile overrides such as `2=192,5=256`.
+- **Prepare Controlled Dynamic Region Tiles** keeps the generation tiles unchanged and emits a separate preview copy labeled with the tile number, native size, and effective expansion.
 - **Automatic + Manual Mask (Protected)** combines an automatic mask with separate hand-painted add, erase, and protection masks.
 - **Prepare Dynamic Region Tiles** emits the entire runtime tile list with a default expansion of 128 and per-tile 128/192/224/256 overrides.
 - **Merge Dynamic Region Tiles (Normalized)** resolves overlaps with normalized ownership and emits a strict-zero union mask for the final composite.

@@ -6,10 +6,18 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 
 
 MAX_RESOLUTION = 16384
+
+
+TILE_CONTROL_PROFILES = {
+    "保守（小块）": (1024, 768, 786432, 160),
+    "标准（已验证）": (1536, 1024, 1572864, 192),
+    "大块（高显存）": (2048, 1280, 2621440, 256),
+}
 
 
 def _to_numpy_mask(mask: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -1148,7 +1156,7 @@ class MaskUnionManualProtect:
 def _parse_expansion_overrides(tile_count: int, default_expand: int, text: str) -> list[int]:
     allowed = {128, 192, 224, 256}
     if default_expand not in allowed:
-        raise ValueError(f"Default expansion must be one of {sorted(allowed)}")
+        raise ValueError(f"默认扩展范围只能是 {sorted(allowed)} 之一")
     values = [default_expand] * tile_count
     stripped = text.strip()
     if not stripped:
@@ -1157,25 +1165,126 @@ def _parse_expansion_overrides(tile_count: int, default_expand: int, text: str) 
     assignment_mode = any("=" in token for token in tokens)
     if assignment_mode:
         if not all("=" in token for token in tokens):
-            raise ValueError("Tile expansion overrides cannot mix positional values with index=value assignments")
+            raise ValueError("逐块扩展不能混用位置列表和“块号=扩展值”两种写法")
         for token in tokens:
             index_text, value_text = (part.strip() for part in token.split("=", 1))
-            index = int(index_text)
+            human_index = int(index_text)
             value = int(value_text)
-            if index < 0 or index >= tile_count:
-                raise ValueError(f"Tile override index {index} is outside 0..{tile_count - 1}")
+            if human_index < 1 or human_index > tile_count:
+                raise ValueError(
+                    f"逐块扩展中的块号 {human_index} 无效；当前预览共有 {tile_count} 块，"
+                    f"请填写 1 到 {tile_count}"
+                )
             if value not in allowed:
-                raise ValueError(f"Tile expansion {value} must be one of {sorted(allowed)}")
-            values[index] = value
+                raise ValueError(f"第 {human_index} 块的扩展值 {value} 无效；只能使用 {sorted(allowed)}")
+            values[human_index - 1] = value
     else:
         if len(tokens) > tile_count:
-            raise ValueError("More positional tile expansion values were supplied than planned tiles")
+            raise ValueError(f"逐块扩展填写了 {len(tokens)} 个值，但当前预览只有 {tile_count} 块")
         for index, token in enumerate(tokens):
             value = int(token)
             if value not in allowed:
-                raise ValueError(f"Tile expansion {value} must be one of {sorted(allowed)}")
+                raise ValueError(f"第 {index + 1} 块的扩展值 {value} 无效；只能使用 {sorted(allowed)}")
             values[index] = value
     return values
+
+
+def _preview_font(size: int) -> ImageFont.ImageFont:
+    candidates = (
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\arial.ttf",
+        "DejaVuSans.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _label_tile_preview(
+    tile_image: torch.Tensor,
+    human_index: int,
+    width: int,
+    height: int,
+    grow: int,
+) -> torch.Tensor:
+    """Return a preview-only copy with a visible 1-based tile label."""
+    batch = _image_batch(tile_image).to(device="cpu", dtype=torch.float32)
+    labeled: list[torch.Tensor] = []
+    font_size = max(18, min(42, int(min(width, height) * 0.035)))
+    font = _preview_font(font_size)
+    label = f"块 {human_index}  |  {width}×{height}  |  扩展 {grow}"
+    for frame in batch:
+        array = (frame.clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+        image = Image.fromarray(array)
+        draw = ImageDraw.Draw(image)
+        box = draw.textbbox((0, 0), label, font=font)
+        padding = max(8, font_size // 3)
+        box_width = min(image.width, box[2] - box[0] + padding * 2)
+        box_height = min(image.height, box[3] - box[1] + padding * 2)
+        draw.rectangle((0, 0, box_width, box_height), fill=(12, 18, 24))
+        draw.text((padding, padding), label, font=font, fill=(255, 232, 90))
+        labeled.append(torch.from_numpy(np.asarray(image).copy()).to(dtype=torch.float32) / 255.0)
+    return torch.stack(labeled, dim=0)
+
+
+class LocalEditTileControls:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tile_profile": (
+                    list(TILE_CONTROL_PROFILES),
+                    {
+                        "default": "标准（已验证）",
+                        "tooltip": "手动显存档位；不会伪装成自动显存检测。标准档沿用当前已验证参数。",
+                    },
+                ),
+                "default_expand": (
+                    ["128", "192", "224", "256"],
+                    {"default": "128", "tooltip": "所有分块默认使用的遮罩扩展范围。"},
+                ),
+                "tile_expansion_overrides": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "例如：2=192,5=256；块号与分块预览一致并从1开始。留空表示全部使用默认值。",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = (
+        "max_long_side",
+        "max_short_side",
+        "max_pixels",
+        "context_pixels",
+        "default_expand",
+        "tile_expansion_overrides",
+    )
+    FUNCTION = "resolve"
+    CATEGORY = "image/universal local edit"
+    DESCRIPTION = "集中输出分块档位、默认扩展和逐块扩展；档位为人工选择，不进行虚假显存自动判断。"
+
+    def resolve(self, tile_profile, default_expand, tile_expansion_overrides):
+        if tile_profile not in TILE_CONTROL_PROFILES:
+            raise ValueError(f"未知分块档位：{tile_profile}")
+        expansion = int(default_expand)
+        if expansion not in {128, 192, 224, 256}:
+            raise ValueError("默认扩展范围只能选择 128、192、224 或 256")
+        max_long_side, max_short_side, max_pixels, context_pixels = TILE_CONTROL_PROFILES[tile_profile]
+        return (
+            max_long_side,
+            max_short_side,
+            max_pixels,
+            context_pixels,
+            expansion,
+            str(tile_expansion_overrides),
+        )
 
 
 class MaskRegionTileBatch:
@@ -1192,7 +1301,7 @@ class MaskRegionTileBatch:
                     {
                         "default": "",
                         "multiline": False,
-                        "tooltip": "Optional: 1=192,4=256 or positional 128,192,128. Blank uses the default for every tile.",
+                        "tooltip": "例如：2=192,5=256；块号与分块预览一致并从1开始。留空表示全部使用默认值。",
                     },
                 ),
             }
@@ -1290,6 +1399,44 @@ class MaskRegionTileBatch:
             indexes,
             json.dumps(report, ensure_ascii=False, indent=2),
         )
+
+
+class MaskRegionTileBatchControlled(MaskRegionTileBatch):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "plan": ("REGION_TILE_PLAN",),
+                "protection_mask": ("MASK",),
+                "default_expand": ("INT", {"forceInput": True}),
+                "tile_expansion_overrides": ("STRING", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = MaskRegionTileBatch.RETURN_TYPES + ("IMAGE",)
+    RETURN_NAMES = MaskRegionTileBatch.RETURN_NAMES + ("labeled_preview_images",)
+    OUTPUT_IS_LIST = MaskRegionTileBatch.OUTPUT_IS_LIST + (True,)
+    FUNCTION = "prepare_controlled"
+    DESCRIPTION = (
+        "由集中控制区提供分块扩展设置，并额外输出带1起始块号、尺寸和扩展值的预览图；"
+        "实际生成仍使用未写字的原始局部块。"
+    )
+
+    def prepare_controlled(self, image, plan, protection_mask, default_expand, tile_expansion_overrides):
+        result = super().prepare(
+            image,
+            plan,
+            protection_mask,
+            default_expand,
+            tile_expansion_overrides,
+        )
+        tile_images, _, _, _, _, widths, heights, grows, _, indexes, _ = result
+        previews = [
+            _label_tile_preview(tile, index + 1, width, height, grow)
+            for tile, index, width, height, grow in zip(tile_images, indexes, widths, heights, grows)
+        ]
+        return result + (previews,)
 
 
 class MaskRegionWeightedMerge:
