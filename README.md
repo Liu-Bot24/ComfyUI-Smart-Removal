@@ -20,7 +20,7 @@ The nodes do not resize the source image. Their hard invariants are:
 
 Connect the dynamic tile outputs directly to a mapped local generation chain. Feed the generated tile list and compositing-mask list to the normalized merge node, then use ComfyUI's core `ImageCompositeMasked` with `resize_source=false` for the final full-resolution composite.
 
-For manual correction, fan one `LoadImage.IMAGE` output into three core `Painter` nodes for additions, erasures, and protected areas. Feed their independent mask outputs to the combine node. The default mode evaluates `automatic + add - erase - protect` in one pass, while the image itself is uploaded only once.
+For manual correction, convert the automatic SAM mask into the alpha channel of the source image with core `JoinImageWithAlpha`, then feed that RGBA image to Impact Pack's `PreviewBridge`. Open the single PreviewBridge node in ComfyUI's MaskEditor, paint missing target areas, and erase false positives or protected areas from the same final mask. This gives the workflow one upload and one editable-mask entry point.
 
 ## Install
 
