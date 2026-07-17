@@ -193,12 +193,8 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
             (1024, 768, 786432, 160, 8, "", 0, "", "测试"),
         )
         self.assertEqual(
-            controls.resolve("兼容旧工作流", "标准（已验证）", "标准（32）", "", "标准（8）", ""),
-            (1536, 1024, 1572864, 192, 32, "", 8, "", "兼容旧工作流"),
-        )
-        self.assertEqual(
             controls.resolve("测试", "大块（高显存）", "大范围（128）", "1=192", "柔和（16）", "1=24"),
-            (2048, 1280, 2621440, 256, 128, "1=192", 16, "1=24", "测试"),
+            (2048, 1536, 3145728, 256, 128, "1=192", 16, "1=24", "测试"),
         )
 
     def test_independent_grow_and_blur_overrides(self):

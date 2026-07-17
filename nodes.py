@@ -17,11 +17,7 @@ MAX_RESOLUTION = 16384
 TILE_CONTROL_PROFILES = {
     "保守（小块）": (1024, 768, 786432, 160),
     "标准": (1536, 1024, 1572864, 192),
-    "大块（高显存）": (2048, 1280, 2621440, 256),
-}
-
-TILE_CONTROL_PROFILE_ALIASES = {
-    "标准（已验证）": "标准",
+    "大块（高显存）": (2048, 1536, 3145728, 256),
 }
 
 GROW_CONTROL_PROFILES = {
@@ -151,6 +147,106 @@ def _make_crop_from_bounds(
     }
 
 
+def _cluster_components_by_context_overlap(
+    components: list[dict[str, Any]],
+    image_width: int,
+    image_height: int,
+    context_pixels: int,
+    multiple: int,
+) -> list[dict[str, Any]]:
+    """Merge disconnected mask fragments whose context crops overlap.
+
+    Generation crops may overlap even when their owned target pixels do not.
+    Planning those fragments independently produces redundant or fully nested
+    tiles.  Clustering before cap-aware splitting lets one coherent edit tile
+    own all nearby fragments whenever the selected tile profile can fit them.
+    """
+    if len(components) <= 1:
+        return components
+
+    crops: list[dict[str, int]] = []
+    for component in components:
+        crop = _make_crop(
+            component["xs"],
+            component["ys"],
+            image_width,
+            image_height,
+            context_pixels,
+            multiple,
+        )
+        if crop is None:
+            raise ValueError("Unable to construct a context crop for a mask component")
+        crops.append(crop)
+
+    parents = list(range(len(components)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    ordered = sorted(range(len(crops)), key=lambda index: crops[index]["x"])
+    active: list[int] = []
+    for index in ordered:
+        crop = crops[index]
+        left = crop["x"]
+        top = crop["y"]
+        right = left + crop["width"]
+        bottom = top + crop["height"]
+        active = [
+            other
+            for other in active
+            if crops[other]["x"] + crops[other]["width"] > left
+        ]
+        for other in active:
+            other_crop = crops[other]
+            other_top = other_crop["y"]
+            other_bottom = other_top + other_crop["height"]
+            if max(top, other_top) < min(bottom, other_bottom):
+                union(index, other)
+        active.append(index)
+
+    grouped: dict[int, list[int]] = {}
+    for index in range(len(components)):
+        grouped.setdefault(find(index), []).append(index)
+
+    clusters: list[dict[str, Any]] = []
+    for indexes in grouped.values():
+        if len(indexes) == 1:
+            component = dict(components[indexes[0]])
+            component["source_component_labels"] = [component["component_id"]]
+            clusters.append(component)
+            continue
+        xs = np.concatenate([components[index]["xs"] for index in indexes])
+        ys = np.concatenate([components[index]["ys"] for index in indexes])
+        labels = [int(components[index]["component_id"]) for index in indexes]
+        clusters.append(
+            {
+                "component_id": labels[0],
+                "source_component_labels": labels,
+                "xs": xs,
+                "ys": ys,
+                "bbox": [
+                    int(xs.min()),
+                    int(ys.min()),
+                    int(xs.max()) + 1,
+                    int(ys.max()) + 1,
+                ],
+                "pixels": int(xs.size),
+            }
+        )
+
+    clusters.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    return clusters
+
+
 def _fits_caps(
     width: int,
     height: int,
@@ -231,7 +327,7 @@ def _choose_cut(values: np.ndarray, min_target_extent: int) -> int:
     return cut
 
 
-def _choose_maximal_prefix_cut(
+def _choose_balanced_two_tile_cut(
     xs: np.ndarray,
     ys: np.ndarray,
     axis: int,
@@ -244,6 +340,13 @@ def _choose_maximal_prefix_cut(
     multiple: int,
     min_target_extent: int,
 ) -> int | None:
+    """Return a balanced cut only when both resulting context crops fit.
+
+    This is the preferred split for a region that is only slightly over the
+    selected profile.  It guarantees that the region becomes exactly two
+    useful tiles instead of filling one tile as much as possible and leaving
+    a tiny remainder tile.
+    """
     values = xs if axis == 1 else ys
     other = ys if axis == 1 else xs
     order = np.argsort(values, kind="stable")
@@ -254,58 +357,111 @@ def _choose_maximal_prefix_cut(
 
     prefix_other_min = np.minimum.accumulate(sorted_other)
     prefix_other_max = np.maximum.accumulate(sorted_other)
+    suffix_other_min = np.minimum.accumulate(sorted_other[::-1])[::-1]
+    suffix_other_max = np.maximum.accumulate(sorted_other[::-1])[::-1]
     boundaries = np.nonzero(sorted_values[1:] != sorted_values[:-1])[0]
     if boundaries.size == 0:
         return None
 
     total_span = int(sorted_values[-1] - sorted_values[0] + 1)
     require_min_extent = total_span >= min_target_extent * 2
-    candidates: list[tuple[int, int, int]] = []
+    lower = int(sorted_values[0])
+    upper = int(sorted_values[-1]) + 1
+    histogram = np.bincount(values - lower, minlength=upper - lower)
+    max_hist = max(1, int(histogram.max()))
+    total_pixels = int(values.size)
+    candidates: list[tuple[float, float, int]] = []
     for boundary in boundaries:
         cut = int(sorted_values[boundary + 1])
-        left_span = cut - int(sorted_values[0])
-        right_span = int(sorted_values[-1]) + 1 - cut
+        left_span = cut - lower
+        right_span = upper - cut
         if require_min_extent and (
             left_span < min_target_extent or right_span < min_target_extent
         ):
             continue
 
         if axis == 1:
-            bounds = (
-                int(sorted_values[0]),
+            left_bounds = (
+                lower,
                 int(prefix_other_min[boundary]),
                 int(sorted_values[boundary]) + 1,
                 int(prefix_other_max[boundary]) + 1,
+            )
+            right_bounds = (
+                cut,
+                int(suffix_other_min[boundary + 1]),
+                upper,
+                int(suffix_other_max[boundary + 1]) + 1,
             )
         else:
-            bounds = (
+            left_bounds = (
                 int(prefix_other_min[boundary]),
-                int(sorted_values[0]),
+                lower,
                 int(prefix_other_max[boundary]) + 1,
                 int(sorted_values[boundary]) + 1,
             )
+            right_bounds = (
+                int(suffix_other_min[boundary + 1]),
+                cut,
+                int(suffix_other_max[boundary + 1]) + 1,
+                upper,
+            )
 
-        crop = _make_crop_from_bounds(
-            *bounds,
+        left_crop = _make_crop_from_bounds(
+            *left_bounds,
             image_width,
             image_height,
             context_pixels,
             multiple,
         )
-        if crop is None or not _fits_caps(
-            crop["width"], crop["height"], max_long_side, max_short_side, max_pixels
+        right_crop = _make_crop_from_bounds(
+            *right_bounds,
+            image_width,
+            image_height,
+            context_pixels,
+            multiple,
+        )
+        if left_crop is None or right_crop is None:
+            continue
+        if not _fits_caps(
+            left_crop["width"],
+            left_crop["height"],
+            max_long_side,
+            max_short_side,
+            max_pixels,
+        ) or not _fits_caps(
+            right_crop["width"],
+            right_crop["height"],
+            max_long_side,
+            max_short_side,
+            max_pixels,
         ):
             continue
 
-        seam_load = int(boundary + 1)
-        candidates.append((seam_load, left_span, cut))
+        left_pixels = int(boundary + 1)
+        right_pixels = total_pixels - left_pixels
+        seam_index = cut - lower
+        seam_load = int(histogram[seam_index - 1])
+        if seam_index < len(histogram):
+            seam_load += int(histogram[seam_index])
+        left_area = left_crop["width"] * left_crop["height"]
+        right_area = right_crop["width"] * right_crop["height"]
+        area_balance = abs(left_area - right_area) / max(left_area, right_area)
+        extent_balance = abs(left_span - right_span) / total_span
+        pixel_balance = abs(left_pixels - right_pixels) / total_pixels
+        seam_penalty = seam_load / max_hist
+        score = (
+            area_balance * 0.40
+            + extent_balance * 0.30
+            + pixel_balance * 0.15
+            + seam_penalty * 0.15
+        )
+        candidates.append((score, abs(cut - (lower + upper) / 2.0), cut))
 
     if not candidates:
         return None
 
-    # Pack as much target as possible into the current safe tile. The second
-    # key favors spatial extent when sparse masks contain uneven pixel density.
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    candidates.sort(key=lambda item: (item[0], item[1]))
     return candidates[0][2]
 
 
@@ -366,7 +522,7 @@ def _split_component(
         values = xs if axis == 1 else ys
         if int(values.max()) == int(values.min()):
             continue
-        cut = _choose_maximal_prefix_cut(
+        cut = _choose_balanced_two_tile_cut(
             xs,
             ys,
             axis,
@@ -515,11 +671,18 @@ def build_region_tile_plan(
         raise ValueError("All mask components were smaller than min_component_pixels")
 
     component_records.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    clustered_records = _cluster_components_by_context_overlap(
+        component_records,
+        width,
+        height,
+        context_pixels,
+        multiple,
+    )
     planned_target = np.zeros_like(sanitized)
     tiles: list[dict[str, Any]] = []
     component_summaries: list[dict[str, Any]] = []
 
-    for ordered_component_id, component in enumerate(component_records):
+    for ordered_component_id, component in enumerate(clustered_records):
         xs = component["xs"]
         ys = component["ys"]
         leaves = _split_component(
@@ -553,6 +716,9 @@ def build_region_tile_plan(
                     "tile_index": tile_index,
                     "component_id": ordered_component_id,
                     "source_component_label": component["component_id"],
+                    "source_component_labels": component.get(
+                        "source_component_labels", [component["component_id"]]
+                    ),
                     "component_tile_index": component_tile_index,
                     "x": x,
                     "y": y,
@@ -570,6 +736,9 @@ def build_region_tile_plan(
             {
                 "component_id": ordered_component_id,
                 "source_component_label": component["component_id"],
+                "source_component_labels": component.get(
+                    "source_component_labels", [component["component_id"]]
+                ),
                 "bbox_xyxy": component["bbox"],
                 "pixels": component["pixels"],
                 "tile_indexes": component_tile_indexes,
@@ -610,6 +779,7 @@ def build_region_tile_plan(
         "dropped_component_pixels": dropped_pixels,
         "raw_component_count": int(component_count_raw),
         "kept_component_count": len(component_records),
+        "cluster_count": len(clustered_records),
         "tile_count": len(tiles),
         "caps": {
             "max_long_side": max_long_side,
@@ -1406,7 +1576,6 @@ class LocalEditTileControls:
         default_blur,
         tile_blur_overrides,
     ):
-        tile_profile = TILE_CONTROL_PROFILE_ALIASES.get(str(tile_profile), str(tile_profile))
         if tile_profile not in TILE_CONTROL_PROFILES:
             raise ValueError(f"未知分块档位：{tile_profile}")
         if default_grow not in GROW_CONTROL_PROFILES:

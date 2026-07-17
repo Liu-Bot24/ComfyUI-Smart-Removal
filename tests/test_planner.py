@@ -52,12 +52,70 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(np.array_equal(plan["union_mask"], mask))
         assert_plan_invariants(plan)
 
+    def test_slightly_over_profile_splits_into_two_balanced_tiles(self):
+        mask = np.zeros((1800, 2600), dtype=np.float32)
+        mask[600:1000, 200:2300] = 1.0
+        plan = build_region_tile_plan(
+            mask,
+            max_long_side=1536,
+            max_short_side=1024,
+            max_pixels=1572864,
+            context_pixels=192,
+            min_target_extent=256,
+        )
+        self.assertEqual(plan["count"], 2)
+        tile_areas = [tile["input_pixels"] for tile in plan["tiles"]]
+        self.assertGreaterEqual(min(tile_areas) / max(tile_areas), 0.75)
+        self.assertTrue(np.array_equal(plan["union_mask"], mask))
+        assert_plan_invariants(plan)
+
     def test_disconnected_components_remain_distinct_and_exact(self):
         mask = np.zeros((1000, 1800), dtype=np.float32)
         mask[100:130, 100:900] = 1.0
         mask[700:760, 1200:1650] = 0.5
         plan = build_region_tile_plan(mask, context_pixels=128, min_target_extent=64)
         self.assertEqual(plan["report"]["kept_component_count"], 2)
+        self.assertEqual(plan["report"]["cluster_count"], 2)
+        self.assertEqual(plan["count"], 2)
+        self.assertTrue(np.array_equal(plan["union_mask"], mask))
+        assert_plan_invariants(plan)
+
+    def test_nearby_disconnected_fragments_merge_into_one_large_profile_tile(self):
+        mask = np.zeros((1600, 2000), dtype=np.float32)
+        mask[400:450, 400:500] = 1.0
+        mask[520:570, 650:750] = 1.0
+        mask[650:710, 820:920] = 1.0
+        mask[790:850, 1000:1080] = 1.0
+        plan = build_region_tile_plan(
+            mask,
+            max_long_side=2048,
+            max_short_side=1536,
+            max_pixels=3145728,
+            context_pixels=256,
+            min_target_extent=256,
+        )
+        self.assertEqual(plan["report"]["kept_component_count"], 4)
+        self.assertEqual(plan["report"]["cluster_count"], 1)
+        self.assertEqual(plan["count"], 1)
+        self.assertTrue(np.array_equal(plan["union_mask"], mask))
+        assert_plan_invariants(plan)
+
+    def test_large_profile_keeps_a_nearby_fragment_group_in_one_tile(self):
+        mask = np.zeros((2000, 2400), dtype=np.float32)
+        mask[300:360, 300:500] = 1.0
+        mask[600:680, 800:1000] = 1.0
+        mask[1000:1080, 1300:1500] = 1.0
+        plan = build_region_tile_plan(
+            mask,
+            max_long_side=2048,
+            max_short_side=1536,
+            max_pixels=3145728,
+            context_pixels=256,
+            min_target_extent=256,
+        )
+        self.assertEqual(plan["report"]["kept_component_count"], 3)
+        self.assertEqual(plan["report"]["cluster_count"], 1)
+        self.assertEqual(plan["count"], 1)
         self.assertTrue(np.array_equal(plan["union_mask"], mask))
         assert_plan_invariants(plan)
 
