@@ -2262,7 +2262,10 @@ class MaskRegionWeightedMerge:
                     "FLOAT",
                     {"default": 0.05, "min": 0.001, "max": 1.0, "step": 0.001},
                 ),
-            }
+            },
+            "optional": {
+                "ownership_masks": ("MASK",),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "IMAGE", "STRING")
@@ -2272,8 +2275,8 @@ class MaskRegionWeightedMerge:
     FUNCTION = "merge"
     CATEGORY = "image/universal local edit"
     DESCRIPTION = (
-        "先把所有原始候选块按无饱和平方距离权重同时累加，再一次性归一化；"
-        "不会把已混入原图的局部块继续顺序覆盖。"
+        "未接唯一归属遮罩时兼容旧版归一化合并；接入后保持归属核心互斥，"
+        "只在明确接缝带内交叉渐变，最后一次性合回原图。"
     )
 
     def merge(
@@ -2288,7 +2291,23 @@ class MaskRegionWeightedMerge:
         support_cutoff,
         edge_ramp_pixels,
         edge_confidence_floor,
+        ownership_masks=None,
     ):
+        if ownership_masks is not None and len(ownership_masks) > 0:
+            return self._merge_with_ownership(
+                destination,
+                candidate_tiles,
+                composite_masks,
+                ownership_masks,
+                x,
+                y,
+                width,
+                height,
+                support_cutoff,
+                edge_ramp_pixels,
+                edge_confidence_floor,
+            )
+
         base = _image_batch(_first(destination)).to(device="cpu", dtype=torch.float32)
         full_height, full_width = int(base.shape[1]), int(base.shape[2])
         lengths = {len(candidate_tiles), len(composite_masks), len(x), len(y), len(width), len(height)}
@@ -2382,6 +2401,305 @@ class MaskRegionWeightedMerge:
             "union_support_pixels": int(torch.count_nonzero(union).item()),
             "overlap_pixels": int(torch.count_nonzero(overlap_count > 1).item()),
             "max_overlap_count": int(overlap_count.max().item()),
+            "outside_union_is_exact_destination": True,
+            "normalized_candidate_weight_sum_in_union": 1.0,
+            "raw_candidates_fused_before_global_composite": True,
+            "tiles": tile_reports,
+        }
+        return (
+            merged.clamp(0.0, 1.0),
+            union.to(dtype=torch.float32).unsqueeze(0),
+            heatmap.clamp(0.0, 1.0),
+            ownership,
+            json.dumps(report, ensure_ascii=False, indent=2),
+        )
+
+    def _merge_with_ownership(
+        self,
+        destination,
+        candidate_tiles,
+        composite_masks,
+        ownership_masks,
+        x,
+        y,
+        width,
+        height,
+        support_cutoff,
+        edge_ramp_pixels,
+        edge_confidence_floor,
+    ):
+        """Fuse shared candidates while keeping ownership exclusive off-seam."""
+        base = _image_batch(_first(destination)).to(device="cpu", dtype=torch.float32)
+        full_height, full_width = int(base.shape[1]), int(base.shape[2])
+        lengths = {
+            len(candidate_tiles),
+            len(composite_masks),
+            len(ownership_masks),
+            len(x),
+            len(y),
+            len(width),
+            len(height),
+        }
+        if len(lengths) != 1 or not candidate_tiles:
+            raise ValueError(
+                "Candidate tile, shared mask, ownership mask, and coordinate list lengths "
+                "must match and be non-empty"
+            )
+
+        cutoff = float(_first(support_cutoff))
+        ramp_pixels = float(_first(edge_ramp_pixels))
+        confidence_floor = float(_first(edge_confidence_floor))
+        tile_count = len(candidate_tiles)
+        coverage = np.zeros((full_height, full_width), dtype=np.uint16)
+        core_owner = np.full((full_height, full_width), -1, dtype=np.int16)
+        propagated_owner = np.full((full_height, full_width), -1, dtype=np.int16)
+        best_distance = np.full((full_height, full_width), np.inf, dtype=np.float32)
+        quality_denominator = torch.zeros((full_height, full_width), dtype=torch.float32)
+        records = []
+        tile_reports = []
+        clipped_core_pixels = 0
+
+        for index, (candidate, shared_mask, ownership_mask) in enumerate(
+            zip(candidate_tiles, composite_masks, ownership_masks)
+        ):
+            px, py = int(x[index]), int(y[index])
+            tile_width, tile_height = int(width[index]), int(height[index])
+            if px < 0 or py < 0 or px + tile_width > full_width or py + tile_height > full_height:
+                raise ValueError(f"Candidate tile {index} is outside the destination")
+
+            source = _image_batch(candidate).to(device="cpu", dtype=torch.float32)
+            if source.shape[1:3] != (tile_height, tile_width):
+                raise ValueError(
+                    f"Candidate tile {index} has shape {tuple(source.shape[1:3])}, "
+                    f"expected {(tile_height, tile_width)}"
+                )
+            local_mask = _mask_batch(shared_mask, tile_height, tile_width)[0]
+            support = local_mask > cutoff
+            support_np = support.numpy()
+            original_core = _mask_batch(ownership_mask, tile_height, tile_width)[0] > 0.5
+            original_core_np = original_core.numpy()
+            # Protection is subtracted from shared_generation_masks after the
+            # planner creates ownership cores.  Those protected pixels are a
+            # legal clip, not an ownership error: only the remaining editable
+            # core participates in exclusivity and propagation.
+            effective_core_np = original_core_np & support_np
+            excluded_core_pixels = int(np.count_nonzero(original_core_np & ~support_np))
+            clipped_core_pixels += excluded_core_pixels
+            if not np.any(effective_core_np):
+                raise ValueError(
+                    f"Effective ownership core {index} is empty after shared generation "
+                    "and protection clipping"
+                )
+
+            core_region = core_owner[py : py + tile_height, px : px + tile_width]
+            if np.any((core_region >= 0) & effective_core_np):
+                raise ValueError("ownership cores overlap")
+            core_region[effective_core_np] = index
+
+            coverage_region = coverage[py : py + tile_height, px : px + tile_width]
+            coverage_region += support_np.astype(np.uint16, copy=False)
+
+            # Propagate each exclusive core only through that tile's shared
+            # generation support.  The nearest supported core owns the pixel;
+            # ties are deterministic because the earlier tile keeps them.
+            local_distance = ndimage.distance_transform_edt(~effective_core_np).astype(
+                np.float32, copy=False
+            )
+            distance_region = best_distance[py : py + tile_height, px : px + tile_width]
+            owner_region = propagated_owner[py : py + tile_height, px : px + tile_width]
+            wins = support_np & (local_distance < distance_region)
+            distance_region[wins] = local_distance[wins]
+            owner_region[wins] = index
+
+            yy, xx = torch.meshgrid(
+                torch.arange(tile_height, dtype=torch.float32),
+                torch.arange(tile_width, dtype=torch.float32),
+                indexing="ij",
+            )
+            margin_x = SAFE_TILE_MARGIN if tile_width > SAFE_TILE_MARGIN * 2 else 0
+            margin_y = SAFE_TILE_MARGIN if tile_height > SAFE_TILE_MARGIN * 2 else 0
+            left = margin_x if px > 0 else 0
+            right = tile_width - margin_x if px + tile_width < full_width else tile_width
+            top = margin_y if py > 0 else 0
+            bottom = tile_height - margin_y if py + tile_height < full_height else tile_height
+            dx = torch.minimum(xx - left + 1.0, right - xx).clamp(min=1.0e-6)
+            dy = torch.minimum(yy - top + 1.0, bottom - yy).clamp(min=1.0e-6)
+            dx /= max(1.0, (right - left + 1.0) / 2.0)
+            dy /= max(1.0, (bottom - top + 1.0) / 2.0)
+            quality = (dx * dy).square() * local_mask * support.to(dtype=torch.float32)
+            quality_denominator[py : py + tile_height, px : px + tile_width] += quality
+
+            records.append(
+                {
+                    "index": index,
+                    "x": px,
+                    "y": py,
+                    "width": tile_width,
+                    "height": tile_height,
+                    "source": source[0],
+                    "support": support,
+                    "quality": quality,
+                }
+            )
+            tile_reports.append(
+                {
+                    "tile_index": index,
+                    "x": px,
+                    "y": py,
+                    "width": tile_width,
+                    "height": tile_height,
+                    "support_pixels": int(torch.count_nonzero(support).item()),
+                    "original_ownership_core_pixels": int(
+                        torch.count_nonzero(original_core).item()
+                    ),
+                    "effective_ownership_core_pixels": int(
+                        np.count_nonzero(effective_core_np)
+                    ),
+                    "ownership_core_clipped_pixels": excluded_core_pixels,
+                }
+            )
+
+        union_np = coverage > 0
+        if np.any(union_np & (propagated_owner < 0)):
+            raise RuntimeError("Shared generation support contains pixels with no ownership")
+
+        # Re-assert the immutable cores after propagation.  This is normally a
+        # no-op, but makes the exclusivity contract explicit and auditable.
+        core_pixels = core_owner >= 0
+        propagated_owner[core_pixels] = core_owner[core_pixels]
+        del best_distance, core_owner, core_pixels, local_distance
+        ownership_seam = _ownership_seam_mask(propagated_owner) & union_np
+        seam_without_overlap = ownership_seam & (coverage < 2)
+        if np.any(seam_without_overlap):
+            raise ValueError(
+                "ownership seam lacks shared generation overlap: "
+                f"{int(np.count_nonzero(seam_without_overlap))} pixels"
+            )
+
+        # edge_ramp_pixels is the full transition width for compatibility with
+        # the existing input.  The per-side radius is capped by the planner's
+        # independently hard-gated 64-pixel shared seam guard.
+        seam_radius = min(
+            SEAM_GUARD_PIXELS,
+            max(1, int(round(ramp_pixels / 2.0))),
+        )
+        seam_band = (
+            _expand_binary_mask(ownership_seam, seam_radius)
+            & union_np
+            & (coverage >= 2)
+        )
+        seam_mix = np.zeros((full_height, full_width), dtype=np.float32)
+        if np.any(seam_band):
+            # Restrict the float64 EDT workspace to the actual transition
+            # bounding box.  A 7008x4672 source must not allocate another
+            # full-resolution float64 distance image just for a narrow seam.
+            seam_y, seam_x = np.nonzero(seam_band)
+            sy0, sy1 = int(seam_y.min()), int(seam_y.max()) + 1
+            sx0, sx1 = int(seam_x.min()), int(seam_x.max()) + 1
+            seam_roi = ownership_seam[sy0:sy1, sx0:sx1]
+            band_roi = seam_band[sy0:sy1, sx0:sx1]
+            seam_distance = ndimage.distance_transform_edt(~seam_roi)
+            raw_mix = np.clip(
+                1.0 - seam_distance / float(seam_radius),
+                0.0,
+                1.0,
+            ).astype(np.float32, copy=False)
+            raw_mix *= band_roi.astype(np.float32, copy=False)
+            seam_mix[sy0:sy1, sx0:sx1] = (
+                raw_mix * raw_mix * (3.0 - 2.0 * raw_mix)
+            )
+
+        numerator = torch.zeros((full_height, full_width, 3), dtype=torch.float32)
+        denominator = torch.zeros((full_height, full_width), dtype=torch.float32)
+        outside_seam_mixed_pixels = 0
+        for record in records:
+            index = record["index"]
+            px, py = record["x"], record["y"]
+            tile_width, tile_height = record["width"], record["height"]
+            owner_region = torch.from_numpy(
+                propagated_owner[py : py + tile_height, px : px + tile_width] == index
+            )
+            seam_mix_region = torch.from_numpy(
+                seam_mix[py : py + tile_height, px : px + tile_width]
+            )
+            seam_band_region = torch.from_numpy(
+                seam_band[py : py + tile_height, px : px + tile_width]
+            )
+            quality_denominator_region = quality_denominator[
+                py : py + tile_height, px : px + tile_width
+            ]
+            normalized_quality = torch.zeros_like(record["quality"])
+            valid_quality = quality_denominator_region > 0
+            normalized_quality[valid_quality] = (
+                record["quality"][valid_quality]
+                / quality_denominator_region[valid_quality]
+            )
+            owner_weight = owner_region.to(dtype=torch.float32) * (1.0 - seam_mix_region)
+            weight = owner_weight + seam_mix_region * normalized_quality
+            weight *= record["support"].to(dtype=torch.float32)
+
+            outside_seam_mixed_pixels += int(
+                torch.count_nonzero(
+                    (weight > 1.0e-7) & ~owner_region & ~seam_band_region
+                ).item()
+            )
+            numerator[py : py + tile_height, px : px + tile_width, :] += (
+                record["source"] * weight[..., None]
+            )
+            denominator[py : py + tile_height, px : px + tile_width] += weight
+
+        union = torch.from_numpy(union_np)
+        if torch.any(union & (denominator <= 0)):
+            raise RuntimeError("Owned candidate weights do not cover the full shared union")
+        if outside_seam_mixed_pixels:
+            raise RuntimeError(
+                "Candidate mixing escaped the explicit seam band: "
+                f"{outside_seam_mixed_pixels} weighted pixels"
+            )
+
+        merged = base.clone()
+        if torch.any(union):
+            merged[0, union, :] = numerator[union, :] / denominator[union].unsqueeze(-1)
+
+        heatmap = base * 0.25
+        overlap_count = torch.from_numpy(coverage.astype(np.int32, copy=False))
+        heatmap[:, overlap_count == 1, :] = torch.tensor(
+            (0.10, 0.42, 1.0), dtype=torch.float32
+        )
+        heatmap[:, overlap_count > 1, :] = torch.tensor(
+            (1.0, 0.10, 0.10), dtype=torch.float32
+        )
+        colors = torch.tensor(
+            (
+                (1.0, 0.25, 0.25),
+                (1.0, 0.72, 0.20),
+                (0.25, 0.85, 0.42),
+                (0.20, 0.55, 1.0),
+                (0.72, 0.30, 1.0),
+                (0.20, 0.90, 0.90),
+            ),
+            dtype=torch.float32,
+        )
+        ownership = torch.full_like(base, 0.05)
+        for index in range(tile_count):
+            owned = torch.from_numpy(propagated_owner == index)
+            ownership[:, owned, :] = colors[index % len(colors)]
+
+        report = {
+            "tile_count": tile_count,
+            "support_cutoff": cutoff,
+            "weighting": "exclusive_owner_with_explicit_seam_crossfade",
+            "edge_ramp_pixels": ramp_pixels,
+            "seam_half_width_pixels": seam_radius,
+            "legacy_edge_confidence_floor_ignored": confidence_floor,
+            "owner_core_overlap_pixels": 0,
+            "owner_core_clipped_by_shared_pixels": clipped_core_pixels,
+            "union_support_pixels": int(np.count_nonzero(union_np)),
+            "overlap_pixels": int(np.count_nonzero(coverage > 1)),
+            "max_overlap_count": int(coverage.max()),
+            "seam_pixels": int(np.count_nonzero(ownership_seam)),
+            "seam_band_pixels": int(np.count_nonzero(seam_band)),
+            "outside_seam_mixed_pixels": outside_seam_mixed_pixels,
             "outside_union_is_exact_destination": True,
             "normalized_candidate_weight_sum_in_union": 1.0,
             "raw_candidates_fused_before_global_composite": True,

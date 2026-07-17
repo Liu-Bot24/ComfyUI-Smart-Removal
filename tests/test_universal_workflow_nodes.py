@@ -381,6 +381,127 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         self.assertFalse(torch.any(transition == 0.5))
         self.assertIn("normalized_squared_separable_safe_crop_distance", report)
 
+    def test_owner_aware_merge_keeps_core_exclusive_and_blends_only_in_seam_band(self):
+        destination = torch.zeros((1, 24, 48, 3), dtype=torch.float32)
+        destination[..., 1] = 1.0
+
+        candidate0 = torch.zeros((1, 24, 32, 3), dtype=torch.float32)
+        candidate0[..., 0] = 1.0
+        candidate1 = torch.zeros((1, 24, 32, 3), dtype=torch.float32)
+        candidate1[..., 2] = 1.0
+
+        shared0 = torch.zeros((1, 24, 32), dtype=torch.float32)
+        shared1 = torch.zeros((1, 24, 32), dtype=torch.float32)
+        shared0[:, 4:20, 4:32] = 1.0
+        shared1[:, 4:20, 0:28] = 1.0
+
+        owner0 = torch.zeros_like(shared0)
+        owner1 = torch.zeros_like(shared1)
+        owner0[:, 6:18, 8:24] = 1.0
+        owner1[:, 6:18, 8:24] = 1.0
+
+        merged, union, _, _, report_json = MODULE.MaskRegionWeightedMerge().merge(
+            [destination],
+            [candidate0, candidate1],
+            [shared0, shared1],
+            [0, 16],
+            [0, 0],
+            [32, 32],
+            [24, 24],
+            [0.02],
+            [8],
+            [0.05],
+            ownership_masks=[owner0, owner1],
+        )
+
+        # The two owner cores meet at global x=24.  Pixels farther than the
+        # explicit seam band must remain exactly one candidate, never an
+        # all-overlap weighted average.
+        self.assertTrue(torch.equal(merged[0, 12, 12], torch.tensor([1.0, 0.0, 0.0])))
+        self.assertTrue(torch.equal(merged[0, 12, 36], torch.tensor([0.0, 0.0, 1.0])))
+        self.assertTrue(torch.all(merged[0, 12, 4:19, 2] == 0.0))
+        self.assertTrue(torch.all(merged[0, 12, 29:44, 0] == 0.0))
+
+        # Only the explicit band around the ownership boundary may contain
+        # both candidates, and its transition must be continuous.
+        line = merged[0, 12]
+        mixed = (line[:, 0] > 0.0) & (line[:, 2] > 0.0)
+        mixed_x = torch.nonzero(mixed, as_tuple=False).flatten()
+        self.assertGreater(int(mixed_x.numel()), 0)
+        self.assertGreaterEqual(int(mixed_x.min()), 19)
+        self.assertLessEqual(int(mixed_x.max()), 28)
+        transition = line[19:29, 0]
+        self.assertTrue(torch.all(torch.diff(transition) <= 0.0))
+        self.assertGreater(float(transition[0]), float(transition[-1]))
+
+        # Raw candidates are normalized before the one global composite, so
+        # the green destination cannot leak into the generated union.
+        self.assertTrue(torch.all(merged[0, 4:20, 4:44, 1] == 0.0))
+        self.assertTrue(torch.all(union[:, 4:20, 4:44] == 1.0))
+        self.assertTrue(torch.equal(merged[:, :, :4], destination[:, :, :4]))
+        self.assertTrue(torch.equal(merged[:, :, 44:], destination[:, :, 44:]))
+
+        report = json.loads(report_json)
+        self.assertEqual(report["weighting"], "exclusive_owner_with_explicit_seam_crossfade")
+        self.assertEqual(report["owner_core_overlap_pixels"], 0)
+        self.assertEqual(report["outside_seam_mixed_pixels"], 0)
+        self.assertGreater(report["seam_band_pixels"], 0)
+
+    def test_owner_aware_merge_rejects_overlapping_ownership_cores(self):
+        destination = torch.zeros((1, 8, 16, 3), dtype=torch.float32)
+        candidates = [
+            torch.zeros((1, 8, 12, 3), dtype=torch.float32),
+            torch.ones((1, 8, 12, 3), dtype=torch.float32),
+        ]
+        shared = [torch.ones((1, 8, 12)), torch.ones((1, 8, 12))]
+        owners = [torch.ones((1, 8, 12)), torch.ones((1, 8, 12))]
+        with self.assertRaisesRegex(ValueError, "ownership cores overlap"):
+            MODULE.MaskRegionWeightedMerge().merge(
+                [destination],
+                candidates,
+                shared,
+                [0, 4],
+                [0, 0],
+                [12, 12],
+                [8, 8],
+                [0.02],
+                [8],
+                [0.05],
+                ownership_masks=owners,
+            )
+
+    def test_owner_aware_merge_clips_core_to_protected_shared_support(self):
+        destination = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        destination[..., 1] = 1.0
+        candidate = torch.zeros((1, 8, 8, 3), dtype=torch.float32)
+        candidate[..., 0] = 1.0
+        shared = torch.zeros((1, 8, 8), dtype=torch.float32)
+        shared[:, 2:6, 2:6] = 1.0
+        original_owner = torch.ones((1, 8, 8), dtype=torch.float32)
+
+        merged, union, _, _, report_json = MODULE.MaskRegionWeightedMerge().merge(
+            [destination],
+            [candidate],
+            [shared],
+            [0],
+            [0],
+            [8],
+            [8],
+            [0.02],
+            [8],
+            [0.05],
+            ownership_masks=[original_owner],
+        )
+
+        self.assertTrue(torch.all(merged[:, 2:6, 2:6, 0] == 1.0))
+        self.assertTrue(torch.all(merged[:, 2:6, 2:6, 1] == 0.0))
+        self.assertTrue(torch.equal(merged[:, :2], destination[:, :2]))
+        self.assertTrue(torch.equal(merged[:, 6:], destination[:, 6:]))
+        self.assertEqual(int(torch.count_nonzero(union).item()), 16)
+        report = json.loads(report_json)
+        self.assertEqual(report["owner_core_clipped_by_shared_pixels"], 48)
+        self.assertEqual(report["tiles"][0]["effective_ownership_core_pixels"], 16)
+
     def test_prompt_suffix_is_fixed_but_instruction_is_user_editable(self):
         node = MODULE.AppendPreservationPrompt()
         prompt = node.build("Replace the selected tattoo with natural skin.")[0]
