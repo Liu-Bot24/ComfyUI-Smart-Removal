@@ -6,10 +6,10 @@ ComfyUI nodes for complete native-resolution local editing workflows:
 - **Get Region Tile (Exact)** returns one tile's coordinates and local ownership mask by index.
 - **SAM3 Detections to Native Regions** converts full-image detections into aligned context crops.
 - **Universal SAM3 Scan Windows (Native)** and **Merge SAM3 Window Masks (Exact)** provide an optional overlap-consensus scan path.
-- **Universal Local Edit Controls** provides one manual tile-size profile, one default expansion, and optional 1-based per-tile overrides such as `2=192,5=256`.
-- **Prepare Controlled Dynamic Region Tiles** keeps the generation tiles unchanged and emits a separate preview copy labeled with the tile number, native size, and effective expansion.
+- **Universal Local Edit Controls** centralizes the editable instruction, manual tile-size profile, independent grow/blur profiles, and optional 1-based per-tile grow/blur overrides.
+- **SAM Prompt Auto English (Offline)** passes English through unchanged and translates Chinese prompts with the already-installed local Argos model; it never downloads a model or calls a network service.
 - **Automatic + Manual Mask (Protected)** combines an automatic mask with separate hand-painted add, erase, and protection masks.
-- **Prepare Dynamic Region Tiles** emits the entire runtime tile list with a default expansion of 128 and per-tile 128/192/224/256 overrides.
+- **Prepare Controlled Dynamic Region Tiles** keeps generation tiles unchanged, emits independent grow/blur values and a separately labeled preview; legacy **Prepare Dynamic Region Tiles** keeps its original 128/192/224/256 behavior for saved-workflow compatibility.
 - **Merge Dynamic Region Tiles (Normalized)** resolves overlaps with normalized ownership and emits a strict-zero union mask for the final composite.
 - **Edit Instruction + Preserve Suffix** keeps the edit request user-editable and appends the fixed preservation sentence.
 

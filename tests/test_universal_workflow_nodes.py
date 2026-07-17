@@ -178,17 +178,44 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
     def test_local_edit_tile_controls_resolve_manual_profiles(self):
         controls = MODULE.LocalEditTileControls()
         self.assertEqual(
-            controls.resolve("标准（已验证）", "128", "2=192"),
-            (1536, 1024, 1572864, 192, 128, "2=192"),
+            controls.resolve(
+                "移除纹身，保持其他内容不变。",
+                "标准（已验证）",
+                "标准（32）",
+                "2=64",
+                "标准（8）",
+                "2=16",
+            ),
+            (1536, 1024, 1572864, 192, 32, "2=64", 8, "2=16", "移除纹身，保持其他内容不变。"),
         )
         self.assertEqual(
-            controls.resolve("保守（小块）", "256", ""),
-            (1024, 768, 786432, 160, 256, ""),
+            controls.resolve("测试", "保守（小块）", "精细（8）", "", "硬边（0）", ""),
+            (1024, 768, 786432, 160, 8, "", 0, "", "测试"),
         )
         self.assertEqual(
-            controls.resolve("大块（高显存）", "224", "1=256"),
-            (2048, 1280, 2621440, 256, 224, "1=256"),
+            controls.resolve("测试", "大块（高显存）", "大范围（128）", "1=192", "柔和（16）", "1=24"),
+            (2048, 1280, 2621440, 256, 128, "1=192", 16, "1=24", "测试"),
         )
+
+    def test_independent_grow_and_blur_overrides(self):
+        self.assertEqual(
+            MODULE._parse_tile_overrides(
+                3, 32, "2=64", allowed=MODULE.GROW_OVERRIDE_VALUES, setting_name="外扩"
+            ),
+            [32, 64, 32],
+        )
+        self.assertEqual(
+            MODULE._parse_tile_overrides(
+                3, 8, "2=4", allowed=MODULE.BLUR_OVERRIDE_VALUES, setting_name="羽化"
+            ),
+            [8, 4, 8],
+        )
+
+    def test_invalid_independent_blur_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "羽化值 7 无效"):
+            MODULE._parse_tile_overrides(
+                2, 8, "1=7", allowed=MODULE.BLUR_OVERRIDE_VALUES, setting_name="羽化"
+            )
 
     def test_dynamic_tile_batch_matches_planner_coordinates(self):
         mask = np.zeros((512, 1800), dtype=np.float32)
@@ -231,11 +258,18 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
         image = torch.full((1, 256, 768, 3), 0.5, dtype=torch.float32)
         protection = torch.zeros((1, 256, 768), dtype=torch.float32)
         result = MODULE.MaskRegionTileBatchControlled().prepare_controlled(
-            image, plan, protection, 128, "2=192"
+            image, plan, protection, 32, "2=64", 8, "2=4"
         )
         raw_tiles = result[0]
+        grows = result[7]
+        blurs = result[8]
         previews = result[-1]
         self.assertEqual(len(previews), plan["count"])
+        self.assertEqual(grows[0], 32)
+        self.assertEqual(blurs[0], 8)
+        if plan["count"] > 1:
+            self.assertEqual(grows[1], 64)
+            self.assertEqual(blurs[1], 4)
         self.assertTrue(torch.all(raw_tiles[0] == 0.5))
         self.assertFalse(torch.equal(previews[0], raw_tiles[0]))
         self.assertEqual(tuple(previews[0].shape), tuple(raw_tiles[0].shape))
@@ -269,10 +303,23 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
     def test_prompt_suffix_is_fixed_but_instruction_is_user_editable(self):
         node = MODULE.AppendPreservationPrompt()
         prompt = node.build("Replace the selected tattoo with natural skin.")[0]
-        self.assertEqual(
-            prompt,
-            "Replace the selected tattoo with natural skin. Do not change anything else in the image.",
-        )
+        self.assertTrue(prompt.startswith("Replace the selected tattoo with natural skin."))
+        self.assertIn("Keep everything outside the selected mask unchanged.", prompt)
+        self.assertIn("match the surrounding material, texture, color, lighting, sharpness", prompt)
+        self.assertIn("Do not introduce unrelated objects", prompt)
+
+    def test_sam_prompt_english_passes_through_unchanged(self):
+        self.assertEqual(MODULE.SAMPromptAutoEnglish().translate("black cable"), ("black cable",))
+
+    def test_sam_prompt_chinese_uses_installed_offline_translation(self):
+        try:
+            translated = MODULE.SAMPromptAutoEnglish().translate("手臂上的纹身")[0]
+        except ValueError as exc:
+            if "未找到内建离线翻译组件" in str(exc):
+                self.skipTest("Argos Translate is not installed in this Python runtime")
+            raise
+        self.assertIn("tattoo", translated.lower())
+        self.assertNotRegex(translated, MODULE.SAMPromptAutoEnglish.CJK_PATTERN)
 
 
 if __name__ == "__main__":

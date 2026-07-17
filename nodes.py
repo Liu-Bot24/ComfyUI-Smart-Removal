@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,27 @@ TILE_CONTROL_PROFILES = {
     "标准（已验证）": (1536, 1024, 1572864, 192),
     "大块（高显存）": (2048, 1280, 2621440, 256),
 }
+
+GROW_CONTROL_PROFILES = {
+    "精细（8）": 8,
+    "小范围（16）": 16,
+    "标准（32）": 32,
+    "中范围（64）": 64,
+    "大范围（128）": 128,
+    "超大范围（192）": 192,
+}
+
+BLUR_CONTROL_PROFILES = {
+    "硬边（0）": 0,
+    "精细（4）": 4,
+    "标准（8）": 8,
+    "柔和（16）": 16,
+    "大范围（32）": 32,
+    "超柔和（64）": 64,
+}
+
+GROW_OVERRIDE_VALUES = {0, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256}
+BLUR_OVERRIDE_VALUES = {0, 2, 4, 8, 12, 16, 24, 32, 48, 64}
 
 
 def _to_numpy_mask(mask: torch.Tensor | np.ndarray) -> np.ndarray:
@@ -1153,11 +1175,17 @@ class MaskUnionManualProtect:
         return target, automatic, manual, protection, overlay
 
 
-def _parse_expansion_overrides(tile_count: int, default_expand: int, text: str) -> list[int]:
-    allowed = {128, 192, 224, 256}
-    if default_expand not in allowed:
-        raise ValueError(f"默认扩展范围只能是 {sorted(allowed)} 之一")
-    values = [default_expand] * tile_count
+def _parse_tile_overrides(
+    tile_count: int,
+    default_value: int,
+    text: str,
+    *,
+    allowed: set[int],
+    setting_name: str,
+) -> list[int]:
+    if default_value not in allowed:
+        raise ValueError(f"默认{setting_name}只能是 {sorted(allowed)} 之一")
+    values = [default_value] * tile_count
     stripped = text.strip()
     if not stripped:
         return values
@@ -1165,28 +1193,45 @@ def _parse_expansion_overrides(tile_count: int, default_expand: int, text: str) 
     assignment_mode = any("=" in token for token in tokens)
     if assignment_mode:
         if not all("=" in token for token in tokens):
-            raise ValueError("逐块扩展不能混用位置列表和“块号=扩展值”两种写法")
+            raise ValueError(f"逐块{setting_name}不能混用位置列表和“块号=数值”两种写法")
         for token in tokens:
             index_text, value_text = (part.strip() for part in token.split("=", 1))
             human_index = int(index_text)
             value = int(value_text)
             if human_index < 1 or human_index > tile_count:
                 raise ValueError(
-                    f"逐块扩展中的块号 {human_index} 无效；当前预览共有 {tile_count} 块，"
+                    f"逐块{setting_name}中的块号 {human_index} 无效；当前预览共有 {tile_count} 块，"
                     f"请填写 1 到 {tile_count}"
                 )
             if value not in allowed:
-                raise ValueError(f"第 {human_index} 块的扩展值 {value} 无效；只能使用 {sorted(allowed)}")
+                raise ValueError(
+                    f"第 {human_index} 块的{setting_name}值 {value} 无效；只能使用 {sorted(allowed)}"
+                )
             values[human_index - 1] = value
     else:
         if len(tokens) > tile_count:
-            raise ValueError(f"逐块扩展填写了 {len(tokens)} 个值，但当前预览只有 {tile_count} 块")
+            raise ValueError(
+                f"逐块{setting_name}填写了 {len(tokens)} 个值，但当前预览只有 {tile_count} 块"
+            )
         for index, token in enumerate(tokens):
             value = int(token)
             if value not in allowed:
-                raise ValueError(f"第 {index + 1} 块的扩展值 {value} 无效；只能使用 {sorted(allowed)}")
+                raise ValueError(
+                    f"第 {index + 1} 块的{setting_name}值 {value} 无效；只能使用 {sorted(allowed)}"
+                )
             values[index] = value
     return values
+
+
+def _parse_expansion_overrides(tile_count: int, default_expand: int, text: str) -> list[int]:
+    """Legacy 128/192/224/256 parser retained for existing saved workflows."""
+    return _parse_tile_overrides(
+        tile_count,
+        default_expand,
+        text,
+        allowed={128, 192, 224, 256},
+        setting_name="扩展",
+    )
 
 
 def _preview_font(size: int) -> ImageFont.ImageFont:
@@ -1209,13 +1254,14 @@ def _label_tile_preview(
     width: int,
     height: int,
     grow: int,
+    blur: int,
 ) -> torch.Tensor:
     """Return a preview-only copy with a visible 1-based tile label."""
     batch = _image_batch(tile_image).to(device="cpu", dtype=torch.float32)
     labeled: list[torch.Tensor] = []
     font_size = max(18, min(42, int(min(width, height) * 0.035)))
     font = _preview_font(font_size)
-    label = f"块 {human_index}  |  {width}×{height}  |  扩展 {grow}"
+    label = f"块 {human_index}  |  {width}×{height}  |  外扩 {grow}  |  羽化 {blur}"
     for frame in batch:
         array = (frame.clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
         image = Image.fromarray(array)
@@ -1230,11 +1276,73 @@ def _label_tile_preview(
     return torch.stack(labeled, dim=0)
 
 
+class SAMPromptAutoEnglish:
+    """Translate Chinese SAM prompts with the already-installed offline Argos model."""
+
+    CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": (
+                    "STRING",
+                    {
+                        "default": "black cable",
+                        "multiline": False,
+                        "tooltip": "中文会在节点内部离线翻译成英文；英文原样通过。不会联网或下载模型。",
+                    },
+                )
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("sam_english_prompt",)
+    FUNCTION = "translate"
+    CATEGORY = "conditioning/universal local edit"
+    DESCRIPTION = "SAM 专用内部离线中译英；英文直接通过，不调用外部程序或网络服务。"
+
+    def translate(self, text):
+        source = str(text).strip()
+        if not source:
+            raise ValueError("SAM 识别对象不能为空")
+        if not self.CJK_PATTERN.search(source):
+            return (source,)
+
+        try:
+            import argostranslate.translate as argos_translate
+        except ImportError as exc:
+            raise ValueError("未找到内建离线翻译组件 Argos Translate；SAM 中文提示词无法安全翻译") from exc
+
+        languages = {language.code: language for language in argos_translate.get_installed_languages()}
+        chinese = languages.get("zh")
+        english = languages.get("en")
+        if chinese is None or english is None:
+            raise ValueError("未找到已安装的中文→英文离线翻译模型；不会自动联网下载")
+        try:
+            translation = chinese.get_translation(english)
+            translated = str(translation.translate(source)).strip()
+        except Exception as exc:
+            raise ValueError(f"SAM 中文提示词离线翻译失败：{exc}") from exc
+        if not translated or self.CJK_PATTERN.search(translated):
+            raise ValueError(f"SAM 中文提示词未能完整翻译为英文：{translated or '<空>'}")
+        return (translated,)
+
+
 class LocalEditTileControls:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "edit_instruction": (
+                    "STRING",
+                    {
+                        "default": "移除选中内容，保持其他内容不变。",
+                        "multiline": True,
+                        "dynamicPrompts": True,
+                        "tooltip": "这里只写要删除或替换成什么；该文本会直接送入 FLUX.2 Klein 编辑流程。",
+                    },
+                ),
                 "tile_profile": (
                     list(TILE_CONTROL_PROFILES),
                     {
@@ -1242,48 +1350,75 @@ class LocalEditTileControls:
                         "tooltip": "手动显存档位；不会伪装成自动显存检测。标准档沿用当前已验证参数。",
                     },
                 ),
-                "default_expand": (
-                    ["128", "192", "224", "256"],
-                    {"default": "128", "tooltip": "所有分块默认使用的遮罩扩展范围。"},
+                "default_grow": (
+                    list(GROW_CONTROL_PROFILES),
+                    {"default": "标准（32）", "tooltip": "生成范围在目标遮罩外侧增加的像素；与羽化完全独立。"},
                 ),
-                "tile_expansion_overrides": (
+                "tile_grow_overrides": (
                     "STRING",
                     {
                         "default": "",
                         "multiline": False,
-                        "tooltip": "例如：2=192,5=256；块号与分块预览一致并从1开始。留空表示全部使用默认值。",
+                        "tooltip": "例如：2=16,5=64；块号与分块预览一致并从1开始。留空表示全部使用默认外扩。",
+                    },
+                ),
+                "default_blur": (
+                    list(BLUR_CONTROL_PROFILES),
+                    {"default": "标准（8）", "tooltip": "只控制合成边缘柔和程度，不再随外扩自动增大。"},
+                ),
+                "tile_blur_overrides": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "例如：2=4,5=16；留空表示全部使用默认羽化。",
                     },
                 ),
             }
         }
 
-    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "STRING")
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "STRING", "INT", "STRING", "STRING")
     RETURN_NAMES = (
         "max_long_side",
         "max_short_side",
         "max_pixels",
         "context_pixels",
-        "default_expand",
-        "tile_expansion_overrides",
+        "default_grow",
+        "tile_grow_overrides",
+        "default_blur",
+        "tile_blur_overrides",
+        "edit_instruction",
     )
     FUNCTION = "resolve"
     CATEGORY = "image/universal local edit"
-    DESCRIPTION = "集中输出分块档位、默认扩展和逐块扩展；档位为人工选择，不进行虚假显存自动判断。"
+    DESCRIPTION = "集中输出编辑要求、显存分块档位，以及彼此独立的外扩和羽化设置。"
 
-    def resolve(self, tile_profile, default_expand, tile_expansion_overrides):
+    def resolve(
+        self,
+        edit_instruction,
+        tile_profile,
+        default_grow,
+        tile_grow_overrides,
+        default_blur,
+        tile_blur_overrides,
+    ):
         if tile_profile not in TILE_CONTROL_PROFILES:
             raise ValueError(f"未知分块档位：{tile_profile}")
-        expansion = int(default_expand)
-        if expansion not in {128, 192, 224, 256}:
-            raise ValueError("默认扩展范围只能选择 128、192、224 或 256")
+        if default_grow not in GROW_CONTROL_PROFILES:
+            raise ValueError(f"未知外扩档位：{default_grow}")
+        if default_blur not in BLUR_CONTROL_PROFILES:
+            raise ValueError(f"未知羽化档位：{default_blur}")
         max_long_side, max_short_side, max_pixels, context_pixels = TILE_CONTROL_PROFILES[tile_profile]
         return (
             max_long_side,
             max_short_side,
             max_pixels,
             context_pixels,
-            expansion,
-            str(tile_expansion_overrides),
+            GROW_CONTROL_PROFILES[default_grow],
+            str(tile_grow_overrides),
+            BLUR_CONTROL_PROFILES[default_blur],
+            str(tile_blur_overrides),
+            str(edit_instruction),
         )
 
 
@@ -1339,12 +1474,37 @@ class MaskRegionTileBatch:
     DESCRIPTION = "Emits a dynamic list of native-resolution tile images, masks, coordinates, and adjustable 128/192/224/256 settings."
 
     def prepare(self, image, plan, protection_mask, default_expand, tile_expansion_overrides):
+        expansions = _parse_expansion_overrides(plan["count"], int(default_expand), tile_expansion_overrides)
+        blurs = [grow // 2 + 1 for grow in expansions]
+        return self._prepare_with_values(
+            image,
+            plan,
+            protection_mask,
+            expansions,
+            blurs,
+            {
+                "default_expand": int(default_expand),
+                "tile_expansion_overrides": tile_expansion_overrides,
+                "legacy_coupled_blur": True,
+            },
+        )
+
+    def _prepare_with_values(
+        self,
+        image,
+        plan,
+        protection_mask,
+        grow_values: list[int],
+        blur_values: list[int],
+        report_settings: dict[str, object],
+    ):
         source = _image_batch(image).to(device="cpu")
         full_height, full_width = int(source.shape[1]), int(source.shape[2])
         protection = _mask_batch(protection_mask, full_height, full_width)
         if plan["report"]["image_width"] != full_width or plan["report"]["image_height"] != full_height:
             raise ValueError("Tile plan dimensions do not match the input image")
-        expansions = _parse_expansion_overrides(plan["count"], int(default_expand), tile_expansion_overrides)
+        if len(grow_values) != plan["count"] or len(blur_values) != plan["count"]:
+            raise ValueError("外扩或羽化设置数量与分块数量不一致")
         tile_images: list[torch.Tensor] = []
         ownership_masks: list[torch.Tensor] = []
         protection_crops: list[torch.Tensor] = []
@@ -1356,7 +1516,7 @@ class MaskRegionTileBatch:
         blurs: list[int] = []
         indexes: list[int] = []
         report_tiles = []
-        for tile, grow in zip(plan["tiles"], expansions):
+        for tile, grow, blur in zip(plan["tiles"], grow_values, blur_values):
             x, y = int(tile["x"]), int(tile["y"])
             width, height = int(tile["width"]), int(tile["height"])
             tile_images.append(source[:, y : y + height, x : x + width, :].clone())
@@ -1367,7 +1527,7 @@ class MaskRegionTileBatch:
             widths.append(width)
             heights.append(height)
             grows.append(grow)
-            blurs.append(grow // 2 + 1)
+            blurs.append(blur)
             indexes.append(int(tile["tile_index"]))
             report_tiles.append(
                 {
@@ -1377,13 +1537,12 @@ class MaskRegionTileBatch:
                     "width": width,
                     "height": height,
                     "grow": grow,
-                    "blur": grow // 2 + 1,
+                    "blur": blur,
                 }
             )
         report = {
             "tile_count": plan["count"],
-            "default_expand": int(default_expand),
-            "tile_expansion_overrides": tile_expansion_overrides,
+            **report_settings,
             "tiles": report_tiles,
         }
         return (
@@ -1409,8 +1568,10 @@ class MaskRegionTileBatchControlled(MaskRegionTileBatch):
                 "image": ("IMAGE",),
                 "plan": ("REGION_TILE_PLAN",),
                 "protection_mask": ("MASK",),
-                "default_expand": ("INT", {"forceInput": True}),
-                "tile_expansion_overrides": ("STRING", {"forceInput": True}),
+                "default_grow": ("INT", {"forceInput": True}),
+                "tile_grow_overrides": ("STRING", {"forceInput": True}),
+                "default_blur": ("INT", {"forceInput": True}),
+                "tile_blur_overrides": ("STRING", {"forceInput": True}),
             }
         }
 
@@ -1419,22 +1580,59 @@ class MaskRegionTileBatchControlled(MaskRegionTileBatch):
     OUTPUT_IS_LIST = MaskRegionTileBatch.OUTPUT_IS_LIST + (True,)
     FUNCTION = "prepare_controlled"
     DESCRIPTION = (
-        "由集中控制区提供分块扩展设置，并额外输出带1起始块号、尺寸和扩展值的预览图；"
+        "由集中控制区分别提供外扩和羽化设置，并额外输出带1起始块号、尺寸、外扩和羽化值的预览图；"
         "实际生成仍使用未写字的原始局部块。"
     )
 
-    def prepare_controlled(self, image, plan, protection_mask, default_expand, tile_expansion_overrides):
-        result = super().prepare(
+    def prepare_controlled(
+        self,
+        image,
+        plan,
+        protection_mask,
+        default_grow,
+        tile_grow_overrides,
+        default_blur,
+        tile_blur_overrides,
+    ):
+        grows = _parse_tile_overrides(
+            plan["count"],
+            int(default_grow),
+            tile_grow_overrides,
+            allowed=GROW_OVERRIDE_VALUES,
+            setting_name="外扩",
+        )
+        blurs = _parse_tile_overrides(
+            plan["count"],
+            int(default_blur),
+            tile_blur_overrides,
+            allowed=BLUR_OVERRIDE_VALUES,
+            setting_name="羽化",
+        )
+        result = self._prepare_with_values(
             image,
             plan,
             protection_mask,
-            default_expand,
-            tile_expansion_overrides,
+            grows,
+            blurs,
+            {
+                "default_grow": int(default_grow),
+                "tile_grow_overrides": tile_grow_overrides,
+                "default_blur": int(default_blur),
+                "tile_blur_overrides": tile_blur_overrides,
+                "legacy_coupled_blur": False,
+            },
         )
-        tile_images, _, _, _, _, widths, heights, grows, _, indexes, _ = result
+        tile_images, _, _, _, _, widths, heights, resolved_grows, resolved_blurs, indexes, _ = result
         previews = [
-            _label_tile_preview(tile, index + 1, width, height, grow)
-            for tile, index, width, height, grow in zip(tile_images, indexes, widths, heights, grows)
+            _label_tile_preview(tile, index + 1, width, height, grow, blur)
+            for tile, index, width, height, grow, blur in zip(
+                tile_images,
+                indexes,
+                widths,
+                heights,
+                resolved_grows,
+                resolved_blurs,
+            )
         ]
         return result + (previews,)
 
@@ -1590,7 +1788,12 @@ class MaskRegionWeightedMerge:
 
 
 class AppendPreservationPrompt:
-    PRESERVATION_SUFFIX = "Do not change anything else in the image."
+    PRESERVATION_SUFFIX = (
+        "Keep everything outside the selected mask unchanged. "
+        "Inside the selected mask, reconstruct only the requested result and match the surrounding "
+        "material, texture, color, lighting, sharpness, and image grain. "
+        "Do not introduce unrelated objects, patterns, or materials."
+    )
 
     @classmethod
     def INPUT_TYPES(cls):

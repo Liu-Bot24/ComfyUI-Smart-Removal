@@ -10,6 +10,7 @@ from .nodes import (
     MaskRegionTilePlanner,
     MaskRegionWeightedMerge,
     MaskUnionManualProtect,
+    SAMPromptAutoEnglish,
 )
 
 
@@ -25,6 +26,7 @@ NODE_CLASS_MAPPINGS = {
     "UniversalLocalEditTileControls": LocalEditTileControls,
     "UniversalRegionWeightedMergeExact": MaskRegionWeightedMerge,
     "UniversalAppendPreservationPrompt": AppendPreservationPrompt,
+    "UniversalSAMPromptAutoEnglish": SAMPromptAutoEnglish,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -39,6 +41,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UniversalLocalEditTileControls": "Universal Local Edit Controls",
     "UniversalRegionWeightedMergeExact": "Merge Dynamic Region Tiles (Normalized)",
     "UniversalAppendPreservationPrompt": "Edit Instruction + Preserve Suffix",
+    "UniversalSAMPromptAutoEnglish": "SAM Prompt Auto English (Offline)",
 }
 
 WEB_DIRECTORY = "./web"
