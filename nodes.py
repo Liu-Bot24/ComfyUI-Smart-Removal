@@ -1289,7 +1289,7 @@ class SAMPromptAutoEnglish:
                     "STRING",
                     {
                         "default": "black cable",
-                        "multiline": False,
+                        "multiline": True,
                         "tooltip": "中文会在节点内部离线翻译成英文；英文原样通过。不会联网或下载模型。",
                     },
                 )

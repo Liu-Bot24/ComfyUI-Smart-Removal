@@ -311,6 +311,14 @@ class UniversalWorkflowNodeTests(unittest.TestCase):
     def test_sam_prompt_english_passes_through_unchanged(self):
         self.assertEqual(MODULE.SAMPromptAutoEnglish().translate("black cable"), ("black cable",))
 
+    def test_sam_prompt_uses_large_in_node_text_editor(self):
+        text_options = MODULE.SAMPromptAutoEnglish.INPUT_TYPES()["required"]["text"][1]
+        self.assertIs(text_options["multiline"], True)
+
+        control_inputs = MODULE.LocalEditTileControls.INPUT_TYPES()["required"]
+        self.assertIs(control_inputs["edit_instruction"][1]["multiline"], True)
+        self.assertIs(control_inputs["tile_grow_overrides"][1]["multiline"], False)
+
     def test_sam_prompt_chinese_uses_installed_offline_translation(self):
         try:
             translated = MODULE.SAMPromptAutoEnglish().translate("手臂上的纹身")[0]
