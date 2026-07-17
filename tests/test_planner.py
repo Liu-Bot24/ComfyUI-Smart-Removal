@@ -119,6 +119,50 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(np.array_equal(plan["union_mask"], mask))
         assert_plan_invariants(plan)
 
+    def test_planner_chooses_combined_split_when_it_uses_fewer_tiles(self):
+        mask = np.zeros((1800, 2400), dtype=np.float32)
+        mask[300:1000, 300:1000] = 1.0
+        mask[300:550, 1200:1550] = 1.0
+        plan = build_region_tile_plan(
+            mask,
+            max_long_side=1536,
+            max_short_side=1024,
+            max_pixels=1572864,
+            context_pixels=192,
+            min_target_extent=256,
+        )
+        self.assertEqual(plan["report"]["cluster_count"], 1)
+        self.assertEqual(plan["count"], 2)
+        self.assertTrue(np.array_equal(plan["union_mask"], mask))
+        assert_plan_invariants(plan)
+
+    def test_planner_chooses_split_then_merge_when_it_uses_fewer_tiles(self):
+        mask = np.zeros((2400, 3800), dtype=np.float32)
+        rectangles = [
+            (2540, 2826, 182, 375),
+            (1625, 2507, 390, 801),
+            (2597, 3504, 632, 987),
+            (1379, 1623, 801, 889),
+            (0, 896, 1446, 1703),
+        ]
+        for x1, x2, y1, y2 in rectangles:
+            mask[y1:y2, x1:x2] = 1.0
+        plan = build_region_tile_plan(
+            mask,
+            max_long_side=1024,
+            max_short_side=768,
+            max_pixels=786432,
+            context_pixels=128,
+            min_target_extent=128,
+        )
+        self.assertEqual(plan["report"]["cluster_count"], 2)
+        self.assertEqual(plan["count"], 6)
+        self.assertTrue(
+            any(tile["source_component_labels"] == [2, 4] for tile in plan["tiles"])
+        )
+        self.assertTrue(np.array_equal(plan["union_mask"], mask))
+        assert_plan_invariants(plan)
+
     def test_empty_mask_is_rejected_instead_of_creating_a_bogus_tile(self):
         mask = np.zeros((512, 512), dtype=np.float32)
         with self.assertRaisesRegex(ValueError, "no active pixels"):

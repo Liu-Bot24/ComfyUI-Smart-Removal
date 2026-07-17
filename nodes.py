@@ -607,6 +607,122 @@ def _split_component(
     )
 
 
+def _crops_overlap(left: dict[str, int], right: dict[str, int]) -> bool:
+    return (
+        max(left["x"], right["x"])
+        < min(left["x"] + left["width"], right["x"] + right["width"])
+        and max(left["y"], right["y"])
+        < min(left["y"] + left["height"], right["y"] + right["height"])
+    )
+
+
+def _merge_compatible_leaves(
+    leaves: list[dict[str, Any]],
+    image_width: int,
+    image_height: int,
+    max_long_side: int,
+    max_short_side: int,
+    max_pixels: int,
+    context_pixels: int,
+    multiple: int,
+) -> list[dict[str, Any]]:
+    """Merge nearby split leaves whenever their joint crop still fits.
+
+    Oversized connected components are split first.  This pass then absorbs
+    nearby disconnected fragments into those already-safe leaves instead of
+    binding every nearby component into one oversized cluster and cutting the
+    combined geometry inefficiently.
+    """
+    groups = [dict(leaf) for leaf in leaves]
+    while True:
+        best: tuple[tuple[int, int, int, int, int], int, int, dict[str, Any]] | None = None
+        for left_index in range(len(groups)):
+            left = groups[left_index]
+            for right_index in range(left_index + 1, len(groups)):
+                right = groups[right_index]
+                if not _crops_overlap(left["crop"], right["crop"]):
+                    continue
+
+                merged_xs = np.concatenate((left["xs"], right["xs"]))
+                merged_ys = np.concatenate((left["ys"], right["ys"]))
+                merged_crop = _make_crop(
+                    merged_xs,
+                    merged_ys,
+                    image_width,
+                    image_height,
+                    context_pixels,
+                    multiple,
+                )
+                if merged_crop is None or not _fits_caps(
+                    merged_crop["width"],
+                    merged_crop["height"],
+                    max_long_side,
+                    max_short_side,
+                    max_pixels,
+                ):
+                    continue
+
+                left_crop = left["crop"]
+                right_crop = right["crop"]
+                overlap_width = max(
+                    0,
+                    min(
+                        left_crop["x"] + left_crop["width"],
+                        right_crop["x"] + right_crop["width"],
+                    )
+                    - max(left_crop["x"], right_crop["x"]),
+                )
+                overlap_height = max(
+                    0,
+                    min(
+                        left_crop["y"] + left_crop["height"],
+                        right_crop["y"] + right_crop["height"],
+                    )
+                    - max(left_crop["y"], right_crop["y"]),
+                )
+                overlap_area = overlap_width * overlap_height
+                separate_union_area = (
+                    left_crop["width"] * left_crop["height"]
+                    + right_crop["width"] * right_crop["height"]
+                    - overlap_area
+                )
+                merged_area = merged_crop["width"] * merged_crop["height"]
+                added_empty_area = merged_area - separate_union_area
+                score = (
+                    added_empty_area,
+                    merged_area,
+                    -overlap_area,
+                    left_index,
+                    right_index,
+                )
+                merged_group = {
+                    "xs": merged_xs,
+                    "ys": merged_ys,
+                    "crop": merged_crop,
+                    "depth": max(int(left["depth"]), int(right["depth"])),
+                    "source_component_labels": sorted(
+                        set(left["source_component_labels"])
+                        | set(right["source_component_labels"])
+                    ),
+                }
+                candidate = (score, left_index, right_index, merged_group)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+
+        if best is None:
+            return groups
+
+        _, left_index, right_index, merged_group = best
+        groups[left_index] = merged_group
+        groups.pop(right_index)
+
+
+def _leaf_plan_score(leaves: list[dict[str, Any]]) -> tuple[int, float, int]:
+    areas = [leaf["crop"]["width"] * leaf["crop"]["height"] for leaf in leaves]
+    balance_penalty = 0.0 if len(areas) <= 1 else 1.0 - min(areas) / max(areas)
+    return len(leaves), balance_penalty, sum(areas)
+
+
 def build_region_tile_plan(
     mask: torch.Tensor | np.ndarray,
     max_long_side: int = 1536,
@@ -682,12 +798,44 @@ def build_region_tile_plan(
     tiles: list[dict[str, Any]] = []
     component_summaries: list[dict[str, Any]] = []
 
+    components_by_label = {
+        int(component["component_id"]): component for component in component_records
+    }
+
     for ordered_component_id, component in enumerate(clustered_records):
         xs = component["xs"]
         ys = component["ys"]
-        leaves = _split_component(
-            xs,
-            ys,
+        atomic_leaves: list[dict[str, Any]] = []
+        source_labels = component.get(
+            "source_component_labels", [component["component_id"]]
+        )
+        for source_label in source_labels:
+            source_component = components_by_label[int(source_label)]
+            source_leaves = _split_component(
+                source_component["xs"],
+                source_component["ys"],
+                width,
+                height,
+                max_long_side,
+                max_short_side,
+                max_pixels,
+                context_pixels,
+                multiple,
+                min_target_extent,
+            )
+            for leaf_x, leaf_y, crop, depth in source_leaves:
+                atomic_leaves.append(
+                    {
+                        "xs": leaf_x,
+                        "ys": leaf_y,
+                        "crop": crop,
+                        "depth": depth,
+                        "source_component_labels": [int(source_label)],
+                    }
+                )
+
+        split_then_merge_leaves = _merge_compatible_leaves(
+            atomic_leaves,
             width,
             height,
             max_long_side,
@@ -695,12 +843,54 @@ def build_region_tile_plan(
             max_pixels,
             context_pixels,
             multiple,
-            min_target_extent,
         )
-        leaves = _sort_leaves_along_principal_axis(leaves, xs, ys)
+        combined_leaves = [
+            {
+                "xs": leaf_x,
+                "ys": leaf_y,
+                "crop": crop,
+                "depth": depth,
+                "source_component_labels": [int(label) for label in source_labels],
+            }
+            for leaf_x, leaf_y, crop, depth in _split_component(
+                xs,
+                ys,
+                width,
+                height,
+                max_long_side,
+                max_short_side,
+                max_pixels,
+                context_pixels,
+                multiple,
+                min_target_extent,
+            )
+        ]
+        merged_leaves = min(
+            (combined_leaves, split_then_merge_leaves),
+            key=_leaf_plan_score,
+        )
+        leaf_lookup = {
+            (id(leaf["xs"]), id(leaf["ys"])): leaf for leaf in merged_leaves
+        }
+        ordered_tuples = _sort_leaves_along_principal_axis(
+            [
+                (leaf["xs"], leaf["ys"], leaf["crop"], int(leaf["depth"]))
+                for leaf in merged_leaves
+            ],
+            xs,
+            ys,
+        )
+        leaves = [
+            leaf_lookup[(id(leaf_x), id(leaf_y))]
+            for leaf_x, leaf_y, _, _ in ordered_tuples
+        ]
 
         component_tile_indexes: list[int] = []
-        for component_tile_index, (leaf_x, leaf_y, crop, depth) in enumerate(leaves):
+        for component_tile_index, leaf in enumerate(leaves):
+            leaf_x = leaf["xs"]
+            leaf_y = leaf["ys"]
+            crop = leaf["crop"]
+            depth = int(leaf["depth"])
             x = crop["x"]
             y = crop["y"]
             tile_width = crop["width"]
@@ -715,10 +905,8 @@ def build_region_tile_plan(
                 {
                     "tile_index": tile_index,
                     "component_id": ordered_component_id,
-                    "source_component_label": component["component_id"],
-                    "source_component_labels": component.get(
-                        "source_component_labels", [component["component_id"]]
-                    ),
+                    "source_component_label": leaf["source_component_labels"][0],
+                    "source_component_labels": leaf["source_component_labels"],
                     "component_tile_index": component_tile_index,
                     "x": x,
                     "y": y,
