@@ -1,0 +1,22 @@
+[project]
+name = "universal-smart-removal"
+version = "0.1.0"
+description = "Native-resolution mask-aware regional tiling and seam-safe merging nodes for ComfyUI local image editing workflows."
+requires-python = ">=3.10"
+dependencies = [
+    "scipy>=1.10,<2",
+    "argostranslate>=1.9.6,<2",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/Liu-Bot24/ComfyUI-Universal-Smart-Removal"
+Documentation = "https://github.com/Liu-Bot24/ComfyUI-Universal-Smart-Removal#readme"
+"Bug Tracker" = "https://github.com/Liu-Bot24/ComfyUI-Universal-Smart-Removal/issues"
+
+[tool.comfy]
+PublisherId = "liu-bot24"
+DisplayName = "Universal Smart Removal"
