@@ -10,7 +10,15 @@
 
 ## 安装方式
 
-### 方式一：通过 Git URL 安装
+### 方式一：通过 ComfyUI Manager 安装
+
+1. 打开 Manager，进入“节点管理”。
+2. 搜索 `Native Region Tile Planner & Merge`，或使用包 ID `native-region-tile-planner-merge` 搜索。
+3. 安装最新版本，然后从原来的 ComfyUI 启动器重启 ComfyUI。
+4. 下载并打开本仓库的 `workflows/ComfyUI-Smart-Removal.json`。
+5. 使用 Manager 的“安装缺失节点”补齐工作流需要的其他公开节点包，然后再次重启 ComfyUI。
+
+### 方式二：通过 Git URL 安装
 
 1. 打开 Manager，点击“通过 Git URL 安装”。
 2. 输入：
@@ -25,7 +33,7 @@
 
 Manager 只能安装节点包和 Python 依赖，不能代替用户接受模型许可或自动安装本页列出的模型文件。
 
-### 方式二：手工安装
+### 方式三：手工安装
 
 在 `ComfyUI/custom_nodes/` 下执行：
 
@@ -88,17 +96,29 @@ python scripts/install_argos_zh_en.py
 6. 确认白色生成范围正确后开启“最终生成”，再次运行。
 7. 最终输出保持原图分辨率；遮罩范围外直接保留原图。
 
-分块档位包括“保守（小块）”“标准”“大块（高显存）”和“超大块（慢速）”。“超大块（慢速）”面向显存充足、需要让大型目标尽量完整进入单个局部块的情况；它不会缩放原图，但会显著增加显存占用和处理时间。
+## 分块档位与合成参数
+
+- **保守（小块）**：显存不足或标准档运行失败时使用；区块较多。
+- **标准**：默认档位，适合先检查遮罩、分块范围和生成效果。
+- **大块（高显存）**：目标较大、需要更多完整上下文且显存充足时使用。
+- **超大块（慢速）**：尽量让大型完整目标进入更少的局部块。该档不会缩放原图，但显存占用和耗时会显著增加；即使在 24GB 显存设备上也可能接近显存上限、运行数分钟，并使 8188 界面或 API 在计算期间暂时无响应。它不是默认档位，也不保证任意目标都能合并为单块。
+
+外扩决定模型需要重建的范围；羽化决定最终生成区域怎样渐变合回原图。羽化不扩大重建范围，分块之间的内部接缝由节点的归属与加权合并逻辑单独处理。
 
 ## 本节点包提供的节点
 
 - `Mask Region Tile Planner (Exact)`
 - `Get Region Tile (Exact)`
+- `Prepare Dynamic Region Tiles`
 - `Prepare Controlled Dynamic Region Tiles`
 - `Universal Local Edit Controls`
 - `Merge Dynamic Region Tiles (Normalized)`
 - `SAM Prompt Auto English (Offline)`
-- 兼容旧工作流的网格、批量分块、手工遮罩和旧合并节点
+- `Edit Instruction + Preserve Suffix`
+- `Universal SAM3 Scan Windows (Native)`
+- `SAM3 Detections to Native Regions`
+- `Merge SAM3 Window Masks (Exact)`
+- `Automatic + Manual Mask (Protected)`
 
 当前归属合并逻辑要求每个核心像素只有一个所属块；相邻块在明确的内部接缝带内交叉渐变，生成范围之外不混入候选图。节点不会缩放整张原图。
 
