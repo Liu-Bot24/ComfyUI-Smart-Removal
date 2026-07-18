@@ -1,6 +1,6 @@
 [project]
 name = "native-region-tile-planner-merge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native-resolution mask-aware regional tiling and seam-safe merging nodes for ComfyUI local image editing workflows."
 requires-python = ">=3.10"
 dependencies = [
