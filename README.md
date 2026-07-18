@@ -6,6 +6,8 @@
 
 仓库内的正式工作流位于 [`workflows/ComfyUI-Smart-Removal.json`](workflows/ComfyUI-Smart-Removal.json)。
 
+本项目在 Comfy Registry 中的底层节点包名称为 `Native Region Tile Planner & Merge`（包 ID：`native-region-tile-planner-merge`）。该名称描述节点包实际承担的原生分辨率分块规划与合并职责；完整工作流和 GitHub 仓库仍名为 `ComfyUI-Smart-Removal`。
+
 ## 安装方式
 
 ### 方式一：通过 Git URL 安装
