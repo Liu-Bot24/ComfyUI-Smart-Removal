@@ -1,42 +1,35 @@
-# ComfyUI 通用智能消除
+# ComfyUI-Smart-Removal
 
-这是一套面向高分辨率图片的局部删除/替换工作流及其配套自定义节点。工作流从一张原图开始，使用 ComfyUI 核心 SAM3.1 自动识别目标和保护对象，在原生分辨率下按遮罩区域动态分块，再使用 FLUX.2 Klein 9B 局部生成，并把结果严格合回原图。
+在原图分辨率下使用 FLUX.2 Klein 模型进行局部智能消除，避免把整张高分辨率图片直接输入模型后发生缩图，并尽量保留未处理区域的原始细节。
 
-仓库内的正式工作流位于 [`workflows/通用智能消除.json`](workflows/%E9%80%9A%E7%94%A8%E6%99%BA%E8%83%BD%E6%B6%88%E9%99%A4.json)。
+工作流从一张原图开始，使用 ComfyUI 核心 SAM3.1 自动识别处理对象和保护对象；随后只围绕目标遮罩规划原生分辨率局部块，使用 FLUX.2 Klein 9B 分块生成，并将处理结果严格合回原图。遮罩范围外不经过生成模型，也不缩放整张原图。
+
+仓库内的正式工作流位于 [`workflows/ComfyUI-Smart-Removal.json`](workflows/ComfyUI-Smart-Removal.json)。
 
 ## 安装方式
 
-### 方式一：ComfyUI Manager 安装缺失节点
-
-这是发布到 Comfy Registry 后的推荐方式。
-
-1. 下载并打开本仓库的 `workflows/通用智能消除.json`。
-2. ComfyUI 提示存在缺失节点时，选择“安装全部”或打开 Manager 的“安装缺失节点”。
-3. 安装完成后，从原来的 ComfyUI 启动器重启 ComfyUI。
-4. 重新打开工作流。
-
-Manager 只能安装节点包和 Python 依赖，不能代替用户接受模型许可或自动安装本页列出的模型文件。
-
-### 方式二：通过 Git URL 安装
-
-适用于仍提供“通过 Git URL 安装”的 ComfyUI Manager 旧版界面。
+### 方式一：通过 Git URL 安装
 
 1. 打开 Manager，点击“通过 Git URL 安装”。
 2. 输入：
 
    ```text
-   https://github.com/Liu-Bot24/ComfyUI-Universal-Smart-Removal
+   https://github.com/Liu-Bot24/ComfyUI-Smart-Removal.git
    ```
 
 3. 安装完成后，从原来的 ComfyUI 启动器重启 ComfyUI。
+4. 下载并打开本仓库的 `workflows/ComfyUI-Smart-Removal.json`。
+5. 打开 Manager 的“安装缺失节点”，安装工作流所需的其他公开节点包，然后再次重启 ComfyUI。
 
-### 方式三：手工安装
+Manager 只能安装节点包和 Python 依赖，不能代替用户接受模型许可或自动安装本页列出的模型文件。
+
+### 方式二：手工安装
 
 在 `ComfyUI/custom_nodes/` 下执行：
 
 ```powershell
-git clone https://github.com/Liu-Bot24/ComfyUI-Universal-Smart-Removal.git
-cd ComfyUI-Universal-Smart-Removal
+git clone https://github.com/Liu-Bot24/ComfyUI-Smart-Removal.git
+cd ComfyUI-Smart-Removal
 python -m pip install -r requirements.txt
 ```
 
@@ -104,20 +97,6 @@ python scripts/install_argos_zh_en.py
 - 兼容旧工作流的网格、批量分块、手工遮罩和旧合并节点
 
 当前归属合并逻辑要求每个核心像素只有一个所属块；相邻块在明确的内部接缝带内交叉渐变，生成范围之外不混入候选图。节点不会缩放整张原图。
-
-## 常见问题
-
-### `unexpected keyword argument 'ownership_masks'`
-
-工作流比已加载的节点代码新。更新本节点包后，必须完整重启 ComfyUI；只刷新网页不会重新加载 Python 节点。
-
-### 工作流能打开，但模型下拉框为空
-
-这是模型文件缺失或目录不正确，与节点安装无关。按“必需模型”表检查四个文件。
-
-### “安装缺失节点”找不到本节点包
-
-新 Manager 只从 Comfy Registry 安装节点包。Registry 收录前请使用“通过 Git URL 安装”或手工 `git clone`。
 
 ## 验证
 
