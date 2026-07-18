@@ -18,5 +18,5 @@ Documentation = "https://github.com/Liu-Bot24/ComfyUI-Smart-Removal#readme"
 "Bug Tracker" = "https://github.com/Liu-Bot24/ComfyUI-Smart-Removal/issues"
 
 [tool.comfy]
-PublisherId = "liu-bot24"
+PublisherId = "lq36821"
 DisplayName = "Smart Removal"
